@@ -1,0 +1,17 @@
+# Build output
+/bin/
+/dist/
+coverage.out
+
+# Local config
+.env
+!.env.example
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Node (SDK, admin UI)
+node_modules/

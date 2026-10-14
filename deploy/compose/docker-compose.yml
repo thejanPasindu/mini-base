@@ -1,0 +1,68 @@
+# mini-base — default stack: minibase + PostgreSQL (2 containers).
+#
+#   cp .env.example .env        # then set POSTGRES_PASSWORD
+#   docker compose up --build
+#
+# Choose features with MINIBASE_MODULES in .env.
+# Optional extras start only when their profile is enabled:
+#   docker compose --profile dev up   # + Mailpit (catches auth emails)
+#   docker compose --profile s3 up    # + MinIO (S3 storage driver)
+
+name: minibase
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: minibase
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d minibase"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Not published to the host by default. Uncomment for local tools (psql, DBeaver):
+    # ports: ["127.0.0.1:5432:5432"]
+
+  minibase:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        VERSION: ${MINIBASE_VERSION:-dev}
+    image: minibase:${MINIBASE_VERSION:-dev}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      MINIBASE_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/minibase?sslmode=disable
+    ports:
+      - "${MINIBASE_PORT:-8090}:8090"
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    profiles: ["dev"]
+    ports:
+      - "127.0.0.1:8025:8025" # web UI
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    profiles: ["s3"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-please}
+    volumes:
+      - miniodata:/data
+    ports:
+      - "127.0.0.1:9001:9001" # console
+
+volumes:
+  pgdata:
+  miniodata:

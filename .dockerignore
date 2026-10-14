@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.vscode
+**/.DS_Store
+**/.env
+bin/
+coverage.out
+docs/
+web/**/node_modules
+sdk/**/node_modules
