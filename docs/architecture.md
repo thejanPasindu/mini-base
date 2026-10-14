@@ -1,6 +1,6 @@
 # mini-base — Architecture Design
 
-> Status: **v0.2 — Phase 0 implemented** · Last updated: 2026-10-14
+> Status: **v0.3 — Phase 1 implemented** · Last updated: 2026-10-14
 > Scope: system design for v1. Implementation details live in code and ADRs (`docs/adr/`).
 
 ---
@@ -99,7 +99,7 @@ Supabase runs ~8–10 containers (GoTrue, PostgREST, Realtime, Storage, Kong, St
 | Logging | `log/slog` (stdlib) | Structured JSON logs, zero dependency. |
 | Metrics | Prometheus `/metrics` (optional) | Off by default. |
 | Password hashing | Argon2id (`golang.org/x/crypto`) | Current OWASP recommendation. |
-| JWT | `golang-jwt/jwt/v5` | HS256 by default, ES256 optional. |
+| JWT | stdlib (`internal/platform/jwt`, HS256 only) | ~100 lines; refusing every other algorithm avoids the classic `alg` confusion bugs. Asymmetric keys can be added later. |
 | Object storage | Local FS driver, S3 driver (`minio-go`) | Local for small installs, S3/MinIO/R2 when needed. |
 | SDK | TypeScript, zero runtime deps, ESM + CJS | Works in browser, Node, Deno, Bun. |
 | Admin UI | SvelteKit (static build, embedded in binary) | Small bundle; served by the `admin` module. Optional. |
@@ -224,8 +224,8 @@ Optional (dotted) dependency = the module works without it but gains features wh
 
 | Module | Default | Prefix | Owns schema | One-line purpose |
 |--------|:------:|--------|-------------|------------------|
-| `auth` | on | `/auth/v1` | `auth` | Users, sessions, JWT, OAuth, magic links |
-| `database` | on | `/rest/v1` | — (reads `public`) | Auto-generated REST API over tables with RLS |
+| `auth` | off | `/auth/v1` | `auth` | Users, sessions, access tokens (✅ Phase 1); OAuth, magic links later |
+| `database` | off | `/rest/v1` | — (reads `public`) | Auto-generated REST API over tables with RLS (✅ Phase 1) |
 | `storage` | off | `/storage/v1` | `storage` | Buckets + files, local or S3 driver, signed URLs |
 | `realtime` | off | `/realtime/v1` (WS) | `realtime` | DB change streams, broadcast, presence |
 | `hooks` | off | `/hooks/v1` | `hooks` | Outbound webhooks on events, retries |
@@ -266,58 +266,75 @@ Dependencies point **inwards only**: `adapter → service → domain`. `domain` 
 { "error": { "code": "auth.invalid_credentials", "message": "Email or password is incorrect", "request_id": "01J…" } }
 ```
 
-### 5.2 `auth`
+### 5.2 `auth` — ✅ Phase 1
 
-**Responsibilities:** sign-up, sign-in, sign-out, refresh, password reset, email verification, magic link, OAuth2 (GitHub, Google first; provider = Strategy pattern), user metadata, admin user management.
+**Implemented:** sign-up, password sign-in, refresh with rotation and reuse detection, sign-out, current user. **Later:** password reset and email verification (need SMTP), magic links, OAuth providers (Strategy pattern), admin user management.
 
-**Keys and tokens:**
+```
+POST /auth/v1/signup                         {email, password}  → 201 session
+POST /auth/v1/token?grant_type=password       {email, password}  → session
+POST /auth/v1/token?grant_type=refresh_token  {refresh_token}    → session (rotated)
+POST /auth/v1/logout                          (Bearer)           → 204
+GET  /auth/v1/user                            (Bearer)           → user
+```
 
-| Credential | Who uses it | Postgres role | RLS |
-|------------|-------------|---------------|-----|
-| `anon` API key | Public clients before login | `minibase_anon` | enforced |
-| User access JWT (15 min) | Logged-in clients | `minibase_authenticated` | enforced, `auth.uid()` available |
-| Refresh token (opaque, rotated, 30 days) | SDK to renew access | — | — |
-| `service` API key | Trusted servers only | `minibase_service` | **bypassed** |
+**Credentials** (every module API request needs the `apikey` header; checked by the kernel's `platform/authn`):
 
-- Refresh tokens are stored hashed, rotated on every use, and **reuse detection** revokes the whole token family.
-- Passwords: Argon2id. Rate limits on sign-in / reset per IP + per email.
-- Publishes: `auth.user.created`, `auth.user.deleted`, `auth.session.created`.
-- Port exported to other modules: `ports.TokenVerifier` (verify JWT → `Principal{UserID, Role, Claims}`).
+| Credential | Who uses it | Runs in Postgres as | RLS |
+|------------|-------------|---------------------|-----|
+| `apikey: <anon key>` | Public clients | `minibase_anon` | enforced |
+| anon key + `Authorization: Bearer <access token>` | Signed-in users | `minibase_authenticated` | enforced, `auth.uid()` available |
+| `apikey: <service key>` | Trusted servers only | the connection user (table owner) | **bypassed** |
 
-### 5.3 `database` — auto REST API
+- API keys are opaque random strings (`MINIBASE_ANON_KEY`, `MINIBASE_SERVICE_KEY`), compared in constant time. They are kernel settings because several modules use them; modules exposing an API refuse to start without them.
+- Access tokens: HS256 JWTs (15 min) signed with `MINIBASE_AUTH_JWT_SECRET`, implemented on the standard library (`platform/jwt`) and accepting no other algorithm. Claims: `iss`, `sub`, `aud`, `role`, `email`, `sid`, `iat`, `exp`.
+- Refresh tokens: 256-bit random, stored only as SHA-256 hashes, single-use. Presenting a used one revokes the whole session (theft signal). Sessions last 30 days, absolute.
+- Passwords: Argon2id (19 MiB, t=2, p=1; PHC format so parameters can rise later), with a cap on concurrent hashes. Unknown email and wrong password are indistinguishable, including timing.
+- Rate limit: per-IP token bucket on sign-up and token endpoints.
+- Shared roles `minibase_anon` and `minibase_authenticated` are created by the kernel's own migration, since several modules rely on them.
+- SQL helpers `auth.uid()`, `auth.role()`, `auth.jwt()` read `request.jwt.claims`; request roles can call them but cannot read `auth.*` tables.
+- Publishes `auth.user.created`, `auth.session.created`, `auth.session.revoked`. Provides `ports.TokenVerifier` to other modules.
+- Known limits: logout does not invalidate already-issued access tokens (they expire within 15 minutes); concurrent refreshes with the same token from one client count as reuse (an SDK must serialise refreshes).
+
+### 5.3 `database` — auto REST API ✅ Phase 1
 
 Turns tables in exposed schemas into a REST API (PostgREST-style, deliberately smaller).
 
 ```
-GET    /rest/v1/todos?select=id,title&done=eq.false&order=created_at.desc&limit=20
-POST   /rest/v1/todos                 (single or bulk insert, Prefer: return=representation)
-PATCH  /rest/v1/todos?id=eq.42
-DELETE /rest/v1/todos?id=eq.42
-POST   /rest/v1/rpc/<function_name>   (call a Postgres function)
+GET    /rest/v1/todos?select=id,title&done=eq.false&order=created_at.desc&limit=20&offset=0
+POST   /rest/v1/todos                 object or array of objects (same keys in every object)
+PATCH  /rest/v1/todos?id=eq.42        object; at least one filter required
+DELETE /rest/v1/todos?id=eq.42        at least one filter required
+Prefer: return=representation        POST/PATCH/DELETE return the affected rows
 ```
+
+Operators: `eq, neq, gt, gte, lt, lte, like, ilike` (`*` = wildcard), `in.(a,b,"c,d")`, `is.null|true|false|unknown`, any of them negated with `not.`. Filters are ANDed.
 
 **Design:**
 
-- **Schema cache** — introspects `information_schema`/`pg_catalog` at start and on `NOTIFY minibase_schema_reload`; only whitelisted schemas are exposed.
-- **Query builder** — parses query params into an AST (`Filter`, `Order`, `Select`, `Range`), validates every identifier against the schema cache, and emits **parameterised SQL only**. No string concatenation of user input — ever.
-- **Security via Postgres RLS:** each request runs in a short transaction:
+- **Schema cache** — reads `pg_catalog` at start for the exposed schemas (`MINIBASE_DATABASE_SCHEMAS`, default `public`). An unknown table or column triggers one reload (throttled to once per second), so new tables work without a restart.
+- **Query builder** (`domain/`, pure and unit-tested) — validates every identifier against the cache, binds every value as a parameter, and casts it in SQL with the column's own type: `"id" = ($1::text)::bigint`. Postgres builds the JSON response (`json_agg`), and inserts and updates go through `json_populate_record(set)`, so no type mapping happens in Go.
+- **Security via Postgres RLS** — each request runs in its own transaction:
 
 ```sql
-BEGIN;
-SET LOCAL ROLE minibase_authenticated;                 -- from the credential
-SELECT set_config('request.jwt.claims', $1, true);     -- JSON claims
--- generated, parameterised query
+BEGIN [READ ONLY];
+SET LOCAL ROLE minibase_authenticated;                           -- or minibase_anon; none for service
+SELECT set_config('request.jwt.claims', $1, true),
+       set_config('statement_timeout', $2, true);
+-- generated, parameterised statement
 COMMIT;
 ```
 
-  Helper SQL functions (`auth.uid()`, `auth.role()`, `auth.jwt()`) read those settings, so developers write normal RLS policies:
-
 ```sql
-CREATE POLICY "own todos" ON public.todos
-  FOR ALL USING (user_id = auth.uid());
+ALTER TABLE public.todos ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON public.todos FOR ALL TO minibase_authenticated
+  USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
 ```
 
-- v1 supported operators: `eq, neq, gt, gte, lt, lte, like, ilike, in, is`; `select` with embedded one-level relations; `order`; `limit/offset`; `count=exact|estimated`.
+- **Secure by default** — anon and signed-in callers are refused (403, with the fix in the message) for tables without RLS enabled, views not created `WITH (security_invoker = true)`, and materialized views and foreign tables. The service key is exempt. `MINIBASE_DATABASE_ALLOW_TABLES_WITHOUT_RLS=true` turns the guard off (unsafe).
+- **Grants** — the module's migration grants table privileges in `public` to the request roles, including for tables created later by the same database user. RLS then decides row access.
+- **Errors** — Postgres errors caused by the request map to 400/403/409 with Postgres's message (e.g. RLS `WITH CHECK` failures → 403). Others are an opaque 500.
+- **Not yet:** embedded relations, `rpc/`, counts (`Content-Range`), upsert, `Accept-Profile` schema switching.
 
 ### 5.4 `storage`
 
@@ -374,9 +391,9 @@ One WebSocket endpoint, three channel types (mirrors the Supabase mental model):
 | **Validation** | DTOs validated at the HTTP adapter edge; domain constructors enforce invariants (e.g. `domain.NewEmail`). |
 | **Errors** | Domain errors are typed (`var ErrUserNotFound = errs.NotFound("auth.user_not_found", …)`); the HTTP adapter maps kinds → status codes in **one** place. |
 | **Observability** | `slog` JSON logs with `request_id`, `module`, `user_id`; optional Prometheus metrics; optional OpenTelemetry traces. |
-| **Rate limiting** | In-memory token bucket per IP/key (pluggable port for Redis later). |
+| **Rate limiting** | In-memory token bucket per client IP (`platform/ratelimit`). `X-Forwarded-For` is ignored until trusted-proxy configuration exists. |
 | **CORS** | Configurable allow-list; `*` only in dev profile. |
-| **Secrets** | `MINIBASE_JWT_SECRET`, `MINIBASE_SERVICE_KEY` required in production mode; server refuses to start with defaults when `MINIBASE_ENV=production`. |
+| **Secrets** | `MINIBASE_ANON_KEY`, `MINIBASE_SERVICE_KEY` (≥ 32 chars, different) and `MINIBASE_AUTH_JWT_SECRET` have no defaults; modules that need them refuse to start without them. |
 | **API versioning** | URL prefix per module (`/auth/v1`). Breaking changes → `v2` routes side by side. |
 | **API contract** | OpenAPI 3.1 spec per module in `api/`, used to generate SDK types and docs. |
 | **Graceful shutdown** | SIGTERM → stop accepting → drain in-flight requests → `Stop()` modules in reverse order → close pool. |
@@ -495,8 +512,8 @@ CI (GitHub Actions): lint → unit → integration → build image → e2e → p
 
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
-| **0 — Skeleton** | Kernel, module registry, config, gateway, migrator, health, Dockerfile, compose, CI | `docker compose up` → `/health/ready` is green; a dummy module can be toggled |
-| **1 — Auth + Database** | Email/password, JWT, refresh rotation, API keys; REST CRUD with RLS | SDK can sign up and CRUD its own rows; another user cannot read them |
+| **0 — Skeleton** ✅ | Kernel, module registry, config, gateway, migrator, health, Dockerfile, compose, CI | `docker compose up` → `/health/ready` is green; a dummy module can be toggled |
+| **1 — Auth + Database** ✅ | Email/password, JWT, refresh rotation, API keys; REST CRUD with RLS | SDK can sign up and CRUD its own rows; another user cannot read them |
 | **2 — Storage** | Buckets, local driver, signed URLs, RLS on objects; S3 driver | Upload/download via SDK with policies |
 | **3 — Realtime** | WS hub, db change channels, broadcast, presence | SDK receives inserts on a table filtered by RLS |
 | **4 — DX** | JS SDK v1, admin dashboard, docs site, OAuth providers, magic link | New user to working app in < 10 minutes |

@@ -38,11 +38,11 @@ func (r *Router) Group(prefix string, mws ...Middleware) *Router {
 	all := make([]Middleware, 0, len(r.mws)+len(mws))
 	all = append(all, r.mws...)
 	all = append(all, mws...)
-	return &Router{
-		mux:    r.mux,
-		prefix: r.prefix + "/" + strings.Trim(prefix, "/"),
-		mws:    all,
+	full := r.prefix
+	if p := strings.Trim(prefix, "/"); p != "" {
+		full += "/" + p
 	}
+	return &Router{mux: r.mux, prefix: full, mws: all}
 }
 
 // Handle registers h for method and path, relative to the group prefix.

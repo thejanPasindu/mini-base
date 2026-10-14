@@ -1,22 +1,26 @@
-# mini-base — default stack: minibase + PostgreSQL (2 containers).
+# mini-base stack.
 #
-#   cp .env.example .env        # then set POSTGRES_PASSWORD
-#   docker compose up --build
+#   cp .env.example .env      # then edit it
+#   docker compose up -d --build
 #
-# Choose features with MINIBASE_MODULES in .env.
-# Optional extras start only when their profile is enabled:
-#   docker compose --profile dev up   # + Mailpit (catches auth emails)
-#   docker compose --profile s3 up    # + MinIO (S3 storage driver)
+# What starts is controlled from .env:
+#   MINIBASE_MODULES   which features run inside minibase (auth, storage, ...)
+#   COMPOSE_PROFILES   which extra containers run next to it:
+#       db    bundled PostgreSQL (default). Remove it to use your own Postgres
+#             via MINIBASE_DATABASE_URL (Neon, RDS, a server on your LAN...).
+#       dev   Mailpit, catches auth emails at http://localhost:8025
+#       s3    MinIO, for the S3 storage driver
 
 name: minibase
 
 services:
   postgres:
     image: postgres:16-alpine
+    profiles: ["db"]
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-} # required when the db profile is on
       POSTGRES_DB: minibase
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -25,8 +29,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    # Not published to the host by default. Uncomment for local tools (psql, DBeaver):
-    # ports: ["127.0.0.1:5432:5432"]
+    ports:
+      # Bound to localhost only, for psql / DBeaver / TablePlus on your machine.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
 
   minibase:
     build:
@@ -39,9 +44,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false # ignored when the db profile is off (Compose ≥ 2.20)
     env_file: .env
     environment:
-      MINIBASE_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/minibase?sslmode=disable
+      # Defaults to the bundled container; set MINIBASE_DATABASE_URL in .env to override.
+      MINIBASE_DATABASE_URL: ${MINIBASE_DATABASE_URL:-postgres://postgres:${POSTGRES_PASSWORD:-}@postgres:5432/minibase?sslmode=disable}
     ports:
       - "${MINIBASE_PORT:-8090}:8090"
 

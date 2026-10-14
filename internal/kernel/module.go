@@ -7,11 +7,13 @@ package kernel
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mini-base/mini-base/internal/platform/authn"
 	"github.com/mini-base/mini-base/internal/platform/httpx"
 )
 
@@ -67,6 +69,19 @@ type Deps struct {
 	Logger   *slog.Logger  // pre-tagged with module=<name>
 	Services *Services     // ports published by other modules
 	Env      Environment   // development or production
+
+	// Auth authenticates API requests (API key + optional access token).
+	// Wrap API routes with Auth.Middleware(); call RequireKeys in Init.
+	Auth *authn.Authenticator
+}
+
+// RequireKeys returns an error explaining how to configure API keys when
+// they are missing. Modules that expose an API call it from Init.
+func (d Deps) RequireKeys() error {
+	if d.Auth == nil || !d.Auth.Configured() {
+		return errors.New("MINIBASE_ANON_KEY and MINIBASE_SERVICE_KEY must be set; generate each with: openssl rand -hex 32")
+	}
+	return nil
 }
 
 // BaseModule provides no-op defaults so modules only implement what they use.

@@ -92,6 +92,17 @@ func TestRouterGroupsAndJSONFallbacks(t *testing.T) {
 		}
 	})
 
+	t.Run("empty sub-group adds middleware without changing the path", func(t *testing.T) {
+		sub := api.Group("", mark("sub"))
+		sub.HandleFunc(http.MethodGet, "/sub", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+		order = nil
+		rec := httptest.NewRecorder()
+		root.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/sub", nil))
+		if rec.Code != http.StatusTeapot || strings.Join(order, ",") != "group,sub" {
+			t.Fatalf("got %d, middleware %v", rec.Code, order)
+		}
+	})
+
 	t.Run("unknown path is JSON 404", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		root.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))

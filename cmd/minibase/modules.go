@@ -2,6 +2,8 @@ package main
 
 import (
 	"github.com/mini-base/mini-base/internal/kernel"
+	"github.com/mini-base/mini-base/internal/modules/auth"
+	"github.com/mini-base/mini-base/internal/modules/database"
 	"github.com/mini-base/mini-base/internal/modules/example"
 )
 
@@ -11,6 +13,8 @@ import (
 func registry() *kernel.Registry {
 	r := kernel.NewRegistry()
 	r.MustRegister(
+		auth.New(),
+		database.New(),
 		example.New(),
 	)
 	return r

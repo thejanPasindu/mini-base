@@ -26,7 +26,7 @@ There are two independent switches, both in `deploy/compose/.env`:
 
 | Setting | What it controls | Example |
 |---|---|---|
-| `MINIBASE_MODULES` | Features **inside** the minibase program | `example` (later `auth,database,storage`) |
+| `MINIBASE_MODULES` | Features **inside** the minibase program | `auth,database` (available: `auth`, `database`, `example`) |
 | `COMPOSE_PROFILES` | Extra **containers** started next to it | `db` = bundled PostgreSQL (default), `dev` = Mailpit, `s3` = MinIO |
 
 PostgreSQL is not a mini-base module: modules are code inside the binary, while Postgres is a separate server that can run next to minibase or anywhere else. That is why it is switched with a Compose profile, and why it is never built into the minibase image.
@@ -72,13 +72,23 @@ Runs unit tests and the architecture tests (which fail if a module imports anoth
 ```bash
 cd deploy/compose
 cp .env.example .env
-# put a random password in .env
-sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env   # macOS
-# sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env    # Linux
-grep -E "COMPOSE_PROFILES|POSTGRES_PASSWORD|MINIBASE_MODULES" .env
+# replace every "change-me" with its own random secret
+for k in POSTGRES_PASSWORD MINIBASE_ANON_KEY MINIBASE_SERVICE_KEY MINIBASE_AUTH_JWT_SECRET; do
+  sed -i '' "s/^$k=.*/$k=$(openssl rand -hex 32)/" .env      # macOS
+  # sed -i "s/^$k=.*/$k=$(openssl rand -hex 32)/" .env       # Linux
+done
+grep -E "^(COMPOSE_PROFILES|MINIBASE_MODULES|POSTGRES_PASSWORD|MINIBASE_.*KEY|MINIBASE_AUTH_JWT_SECRET)=" .env
 ```
 
-✅ Shows `COMPOSE_PROFILES=db`, a long random password, and `MINIBASE_MODULES=example`.
+✅ Shows `COMPOSE_PROFILES=db`, `MINIBASE_MODULES=auth,database`, and four different 64-character secrets. No `change-me` is left.
+
+> ⚠️ **Already started the stack before?** Keep your old `POSTGRES_PASSWORD`. The bundled Postgres sets its password only when its data volume is first created; a new value in `.env` makes mini-base fail with `password authentication failed`. Copy the old value back, or see Troubleshooting.
+
+| Secret | What it is |
+|---|---|
+| `MINIBASE_ANON_KEY` | Public key for your apps. Safe in a browser or mobile app, because RLS policies limit what it can do. |
+| `MINIBASE_SERVICE_KEY` | Full-access key that bypasses RLS. Only for your own servers; never ship it in an app. |
+| `MINIBASE_AUTH_JWT_SECRET` | Signs access tokens. Changing it signs everyone out. |
 
 > If Postgres already runs on your machine, port 5432 is taken. Set `POSTGRES_PORT=5433` in `.env`.
 > `.env` holds secrets and is git-ignored. Never commit it.
@@ -98,18 +108,101 @@ docker compose ps
 curl localhost:8090/health/ready
 ```
 
-✅ `{"status":"ok","checks":{"database":"ok"}}`
+✅ `"status":"ok"`, with every check `ok`.
 
 ## 6. Try the API
 
+This walkthrough creates a table, signs up two users, and shows that each user only sees their own rows.
+
+**6.1 Load the keys into your shell** (still inside `deploy/compose`)
+
 ```bash
-curl -X POST localhost:8090/example/v1/greetings \
-  -H 'Content-Type: application/json' -d '{"message":"hello"}'
-curl localhost:8090/example/v1/greetings
-curl localhost:8090/
+set -a; source .env; set +a
+API=http://localhost:8090
 ```
 
-✅ The second command returns your `"hello"` inside `"data"`. The last shows the version and enabled modules.
+**6.2 Create a table with row level security**
+
+```bash
+docker compose exec -T postgres psql -U postgres -d minibase <<'SQL'
+CREATE TABLE public.todos (
+  id      bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id uuid    NOT NULL DEFAULT auth.uid(),   -- the signed-in user
+  title   text    NOT NULL,
+  done    boolean NOT NULL DEFAULT false
+);
+ALTER TABLE public.todos ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON public.todos FOR ALL TO minibase_authenticated
+  USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+SQL
+```
+
+✅ Prints `CREATE TABLE`, `ALTER TABLE`, `CREATE POLICY`. There's no need to restart mini-base: it notices new tables on first use.
+
+**6.3 Sign up two users**
+
+```bash
+ALICE=$(curl -s -X POST $API/auth/v1/signup -H "apikey: $MINIBASE_ANON_KEY" \
+  -H 'Content-Type: application/json' -d '{"email":"alice@example.com","password":"correct horse battery"}' \
+  | sed -E 's/.*"access_token":"([^"]+)".*/\1/')
+BOB=$(curl -s -X POST $API/auth/v1/signup -H "apikey: $MINIBASE_ANON_KEY" \
+  -H 'Content-Type: application/json' -d '{"email":"bob@example.com","password":"correct horse battery"}' \
+  | sed -E 's/.*"access_token":"([^"]+)".*/\1/')
+echo "${ALICE:0:20}…  ${BOB:0:20}…"
+```
+
+✅ Two token prefixes starting with `eyJ`. (If you run this twice, sign-up returns `auth.email_taken`. Sign in instead with `POST $API/auth/v1/token?grant_type=password` and the same body.)
+
+**6.4 Alice adds a todo; Bob can't see it**
+
+```bash
+curl -s -X POST "$API/rest/v1/todos" -H "apikey: $MINIBASE_ANON_KEY" -H "Authorization: Bearer $ALICE" \
+  -H 'Content-Type: application/json' -H 'Prefer: return=representation' -d '{"title":"buy milk"}'
+echo
+curl -s "$API/rest/v1/todos?select=id,title,done" -H "apikey: $MINIBASE_ANON_KEY" -H "Authorization: Bearer $ALICE"; echo
+curl -s "$API/rest/v1/todos" -H "apikey: $MINIBASE_ANON_KEY" -H "Authorization: Bearer $BOB"; echo
+```
+
+✅ The first command returns the new row with Alice's `user_id`. Alice's list shows `buy milk`. Bob's list is `[]`.
+
+**6.5 Filter, update, delete**
+
+```bash
+AUTH=(-H "apikey: $MINIBASE_ANON_KEY" -H "Authorization: Bearer $ALICE")
+curl -s "$API/rest/v1/todos?done=eq.false&order=id.desc&limit=10" "${AUTH[@]}"; echo
+curl -s -X PATCH "$API/rest/v1/todos?title=eq.buy%20milk" "${AUTH[@]}" \
+  -H 'Content-Type: application/json' -H 'Prefer: return=representation' -d '{"done":true}'; echo
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE "$API/rest/v1/todos?done=is.true" "${AUTH[@]}"
+```
+
+✅ The row comes back with `"done":true`, then the delete prints `204`.
+
+**6.6 Who am I; sign out**
+
+```bash
+curl -s $API/auth/v1/user "${AUTH[@]}"; echo
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $API/auth/v1/logout "${AUTH[@]}"
+```
+
+✅ Alice's id and email, then `204`.
+
+**Query cheat-sheet**
+
+| Want | Query string |
+|---|---|
+| Some columns | `select=id,title` |
+| Equals / not equals | `done=eq.false`, `done=neq.true` |
+| Compare | `id=gt.10`, `due=lte.2026-12-31` |
+| Pattern (`*` = any text) | `title=ilike.*milk*` |
+| One of | `id=in.(1,2,3)` |
+| Null / boolean | `due=is.null`, `done=is.true` |
+| Negate any filter | `title=not.ilike.*milk*` |
+| Sort | `order=due.desc.nullslast,id` |
+| Page | `limit=20&offset=40` |
+
+PATCH and DELETE need at least one filter, so a whole table is never changed by accident. Tables without RLS are refused with a message explaining how to enable it.
+
+The `example` module still works if you add it to `MINIBASE_MODULES` (`auth,database,example`).
 
 ## 7. Look inside Postgres
 
@@ -175,6 +268,15 @@ make run    # builds ./bin/minibase, starts the throwaway Postgres, serves on :8
 
 Stop with `Ctrl+C`. If the Compose stack is also running, stop it first (`docker compose down` in `deploy/compose`), because both use port 8090.
 
+To run `auth` and `database` this way, give the binary the same secrets as step 4:
+
+```bash
+make build db-up
+set -a; source deploy/compose/.env; set +a        # keys and JWT secret
+MINIBASE_DATABASE_URL="postgres://postgres:postgres@127.0.0.1:55432/postgres?sslmode=disable" \
+  ./bin/minibase serve --modules=auth,database
+```
+
 Useful binary commands:
 
 ```bash
@@ -213,9 +315,18 @@ mini-base creates its own schemas (`minibase`, plus one per enabled module) on f
 
 | Symptom | Cause and fix |
 |---|---|
+| `MINIBASE_ANON_KEY and MINIBASE_SERVICE_KEY must be set` at startup | Step 4 was skipped or `.env` still says `change-me`. Generate the keys and restart. |
+| `MINIBASE_AUTH_JWT_SECRET must be at least 32 characters` | Same: generate it with `openssl rand -hex 32`. |
+| `permission denied to create role` at startup | The database user needs `CREATEROLE` (or superuser): mini-base creates the `minibase_anon` and `minibase_authenticated` roles. |
+| `401 auth.missing_api_key` | Every `/auth/v1` and `/rest/v1` request needs the `apikey` header. |
+| `401 auth.invalid_token` | The access token expired (15 min) or was signed with an old JWT secret. Refresh it with `grant_type=refresh_token`, or sign in again. |
+| `403 database.rls_disabled` | The table has no row level security. Run `ALTER TABLE … ENABLE ROW LEVEL SECURITY;` and add policies. Or use the service key from a trusted server. |
+| `403 database.permission_denied` | A policy blocked the write (`WITH CHECK`), or the table was created by a different database user, so the request roles got no grants. Fix with: `GRANT SELECT, INSERT, UPDATE, DELETE ON public.<table> TO minibase_anon, minibase_authenticated;` |
+| `404 database.table_not_found` | The table isn't in `public` (or `MINIBASE_DATABASE_SCHEMAS`), or there's a typo in the name. |
+| Reads return `[]` though rows exist | RLS is working: no policy lets this caller see them. Anonymous callers need their own policy (`TO minibase_anon`). |
 | `port is already allocated` for 5432 | Another Postgres is running. Set `POSTGRES_PORT=5433` in `.env`. |
 | `port is already allocated` for 8090 | Something else uses 8090, often `make run`. Stop it or set `MINIBASE_PORT=8091`. |
-| `password authentication failed` after changing `POSTGRES_PASSWORD` | Postgres sets the password only when the volume is first created. Change it back, or reset with `docker compose down -v` (deletes data). |
+| `database rejected the credentials` / `password authentication failed` | `POSTGRES_PASSWORD` in `.env` differs from the password the data volume was created with. Keep your data and update Postgres to the `.env` value (in `deploy/compose`): `set -a; source .env; set +a; docker compose exec -T postgres psql -U postgres -c "ALTER USER postgres PASSWORD '$POSTGRES_PASSWORD';"` then `docker compose restart minibase`. Or start over with `docker compose down -v` (⚠️ deletes all data). |
 | `"COPY go.sum": not found` during build | Run step 2 (`go mod tidy`) first. |
 | `depends_on ... required` is rejected | Docker Compose is older than v2.20. Update Docker Desktop. |
 | Postgres container exits immediately | `POSTGRES_PASSWORD` is empty in `.env`. |

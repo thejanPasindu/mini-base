@@ -4,10 +4,11 @@
 //
 //	make test-integration
 //
-// which starts Postgres via Docker Compose and sets MINIBASE_TEST_DATABASE_URL.
+// which starts Postgres via Docker and sets MINIBASE_TEST_DATABASE_URL.
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -19,8 +20,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/mini-base/mini-base/internal/kernel"
+	"github.com/mini-base/mini-base/internal/modules/auth"
+	"github.com/mini-base/mini-base/internal/modules/database"
 	"github.com/mini-base/mini-base/internal/modules/example"
+)
+
+const (
+	anonKey    = "itest-anon-key-0123456789abcdef0123456789"
+	serviceKey = "itest-service-key-0123456789abcdef01234567"
+	jwtSecret  = "itest-jwt-secret-0123456789abcdef012345678"
 )
 
 func testDatabaseURL(t *testing.T) string {
@@ -32,28 +43,36 @@ func testDatabaseURL(t *testing.T) string {
 	return url
 }
 
-// startKernel runs a kernel with the example module on an ephemeral port and
-// returns its base URL. The kernel stops when the test ends.
-func startKernel(t *testing.T, modules ...string) string {
-	t.Helper()
+func registry() *kernel.Registry {
+	r := kernel.NewRegistry()
+	r.MustRegister(auth.New(), database.New(), example.New())
+	return r
+}
 
-	cfg, err := kernel.LoadConfig(func(k string) string {
-		switch k {
-		case "MINIBASE_DATABASE_URL":
-			return testDatabaseURL(t)
-		case "MINIBASE_MODULES":
-			return strings.Join(modules, ",")
-		case "MINIBASE_HTTP_SHUTDOWN_TIMEOUT":
-			return "2s"
-		}
-		return ""
-	})
+func envFunc(t *testing.T, modules string) func(string) string {
+	t.Helper()
+	env := map[string]string{
+		"MINIBASE_DATABASE_URL":               testDatabaseURL(t),
+		"MINIBASE_MODULES":                    modules,
+		"MINIBASE_HTTP_SHUTDOWN_TIMEOUT":      "2s",
+		"MINIBASE_ANON_KEY":                   anonKey,
+		"MINIBASE_SERVICE_KEY":                serviceKey,
+		"MINIBASE_AUTH_JWT_SECRET":            jwtSecret,
+		"MINIBASE_AUTH_RATE_LIMIT_PER_MINUTE": "0",
+		"MINIBASE_DATABASE_STATEMENT_TIMEOUT": "5s",
+	}
+	return func(k string) string { return env[k] }
+}
+
+// startKernel runs a kernel on an ephemeral port and returns its base URL.
+// The kernel stops when the test ends.
+func startKernel(t *testing.T, modules string) string {
+	t.Helper()
+	getenv := envFunc(t, modules)
+	cfg, err := kernel.LoadConfig(getenv)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	reg := kernel.NewRegistry()
-	reg.MustRegister(example.New())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -61,8 +80,7 @@ func startKernel(t *testing.T, modules ...string) string {
 	}
 	ready := make(chan net.Addr, 1)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	k := kernel.New(cfg, reg, log, "test", func(string) string { return "" },
-		kernel.WithListener(ln), kernel.WithReadyNotify(ready))
+	k := kernel.New(cfg, registry(), log, "test", getenv, kernel.WithListener(ln), kernel.WithReadyNotify(ready))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -85,75 +103,219 @@ func startKernel(t *testing.T, modules ...string) string {
 	return ""
 }
 
-func TestKernelServesHealthAndExampleModule(t *testing.T) {
-	base := startKernel(t, "example")
+// ---- tiny HTTP client ----
 
-	resp, err := http.Get(base + "/health/ready")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("ready = %d", resp.StatusCode)
-	}
+type client struct {
+	t     *testing.T
+	base  string
+	key   string
+	token string
+}
 
-	resp, err = http.Post(base+"/example/v1/greetings", "application/json", strings.NewReader(`{"message":"hello"}`))
+func (c client) do(method, path, body string, headers ...string) (int, []byte) {
+	c.t.Helper()
+	req, err := http.NewRequest(method, c.base+path, strings.NewReader(body))
 	if err != nil {
-		t.Fatal(err)
+		c.t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create = %d", resp.StatusCode)
+	if c.key != "" {
+		req.Header.Set("apikey", c.key)
 	}
-
-	resp, err = http.Get(base + "/example/v1/greetings?limit=1")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		c.t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	var body struct {
-		Data []struct{ Message string } `json:"data"`
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b
+}
+
+type session struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	User         struct {
+		ID string `json:"id"`
+	} `json:"user"`
+}
+
+func decode[T any](t *testing.T, b []byte) T {
+	t.Helper()
+	var v T
+	if err := json.Unmarshal(b, &v); err != nil {
+		t.Fatalf("decode %s: %v", b, err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatal(err)
+	return v
+}
+
+func expect(t *testing.T, what string, gotStatus int, body []byte, wantStatus int) {
+	t.Helper()
+	if gotStatus != wantStatus {
+		t.Fatalf("%s: status %d, want %d: %s", what, gotStatus, wantStatus, body)
 	}
-	if len(body.Data) != 1 || body.Data[0].Message != "hello" {
-		t.Fatalf("list = %+v", body)
+}
+
+// ---- tests ----
+
+func TestKernelServesHealthAndExampleModule(t *testing.T) {
+	base := startKernel(t, "example")
+	c := client{t: t, base: base}
+
+	st, b := c.do(http.MethodGet, "/health/ready", "")
+	expect(t, "ready", st, b, http.StatusOK)
+
+	st, b = c.do(http.MethodPost, "/example/v1/greetings", `{"message":"hello"}`)
+	expect(t, "create greeting", st, b, http.StatusCreated)
+
+	st, b = c.do(http.MethodGet, "/example/v1/greetings?limit=1", "")
+	expect(t, "list greetings", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte(`"message":"hello"`)) {
+		t.Fatalf("list = %s", b)
 	}
 }
 
 func TestDisabledModuleHasNoRoutes(t *testing.T) {
-	base := startKernel(t) // kernel only
-
-	resp, err := http.Get(base + "/example/v1/ping")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("disabled module route = %d, want 404", resp.StatusCode)
-	}
+	c := client{t: t, base: startKernel(t, "")}
+	st, b := c.do(http.MethodGet, "/example/v1/ping", "")
+	expect(t, "disabled module route", st, b, http.StatusNotFound)
 }
 
 func TestMigrationsAreIdempotent(t *testing.T) {
 	for range 2 {
-		cfg, err := kernel.LoadConfig(func(k string) string {
-			switch k {
-			case "MINIBASE_DATABASE_URL":
-				return testDatabaseURL(t)
-			case "MINIBASE_MODULES":
-				return "example"
-			}
-			return ""
-		})
+		getenv := envFunc(t, "auth,database,example")
+		cfg, err := kernel.LoadConfig(getenv)
 		if err != nil {
 			t.Fatal(err)
 		}
-		reg := kernel.NewRegistry()
-		reg.MustRegister(example.New())
-		k := kernel.New(cfg, reg, slog.New(slog.NewTextHandler(io.Discard, nil)), "test", func(string) string { return "" })
+		k := kernel.New(cfg, registry(), slog.New(slog.NewTextHandler(io.Discard, nil)), "test", getenv)
 		if err := k.Migrate(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+// TestPhase1 is the Phase 1 exit criterion: users sign up, write rows, and
+// row-level security keeps each user's rows private.
+func TestPhase1(t *testing.T) {
+	ctx := context.Background()
+
+	// Run migrations first so auth.uid() exists for the policy below.
+	getenv := envFunc(t, "auth,database")
+	cfg, _ := kernel.LoadConfig(getenv)
+	if err := kernel.New(cfg, registry(), slog.New(slog.NewTextHandler(io.Discard, nil)), "test", getenv).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := pgxpool.New(ctx, testDatabaseURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		DROP TABLE IF EXISTS public.itest_todos, public.itest_open;
+		CREATE TABLE public.itest_todos (
+		    id      bigint  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+		    user_id uuid    NOT NULL DEFAULT auth.uid(),
+		    title   text    NOT NULL,
+		    done    boolean NOT NULL DEFAULT false
+		);
+		ALTER TABLE public.itest_todos ENABLE ROW LEVEL SECURITY;
+		CREATE POLICY own_rows ON public.itest_todos FOR ALL TO minibase_authenticated
+		    USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+		CREATE TABLE public.itest_open (id int);`); err != nil {
+		t.Fatal(err)
+	}
+
+	base := startKernel(t, "auth,database")
+	anon := client{t: t, base: base, key: anonKey}
+	svc := client{t: t, base: base, key: serviceKey}
+	suffix := time.Now().Format("150405.000000")
+
+	signUp := func(name string) (client, session) {
+		st, b := anon.do(http.MethodPost, "/auth/v1/signup",
+			`{"email":"`+name+suffix+`@example.com","password":"correct horse battery"}`)
+		expect(t, "sign up "+name, st, b, http.StatusCreated)
+		s := decode[session](t, b)
+		return client{t: t, base: base, key: anonKey, token: s.AccessToken}, s
+	}
+	alice, aliceSession := signUp("alice")
+	bob, _ := signUp("bob")
+
+	// Alice creates a todo; user_id defaults to her id via auth.uid().
+	st, b := alice.do(http.MethodPost, "/rest/v1/itest_todos", `{"title":"alice todo"}`, "Prefer", "return=representation")
+	expect(t, "alice insert", st, b, http.StatusCreated)
+	if !bytes.Contains(b, []byte(aliceSession.User.ID)) {
+		t.Fatalf("row not owned by alice: %s", b)
+	}
+
+	st, b = alice.do(http.MethodGet, "/rest/v1/itest_todos?select=title", "")
+	expect(t, "alice read", st, b, http.StatusOK)
+	if string(b) != `[{"title":"alice todo"}]` {
+		t.Fatalf("alice sees %s", b)
+	}
+
+	// Bob sees nothing and cannot change Alice's row.
+	st, b = bob.do(http.MethodGet, "/rest/v1/itest_todos", "")
+	expect(t, "bob read", st, b, http.StatusOK)
+	if string(b) != `[]` {
+		t.Fatalf("bob sees alice's rows: %s", b)
+	}
+	st, b = bob.do(http.MethodPatch, "/rest/v1/itest_todos?title=eq.alice%20todo", `{"done":true}`, "Prefer", "return=representation")
+	expect(t, "bob update", st, b, http.StatusOK)
+	if string(b) != `[]` {
+		t.Fatalf("bob updated alice's row: %s", b)
+	}
+	st, b = bob.do(http.MethodPost, "/rest/v1/itest_todos", `{"title":"forged","user_id":"`+aliceSession.User.ID+`"}`)
+	expect(t, "bob forges ownership", st, b, http.StatusForbidden)
+
+	// Anonymous callers have no policy, so they see nothing.
+	st, b = anon.do(http.MethodGet, "/rest/v1/itest_todos", "")
+	expect(t, "anon read", st, b, http.StatusOK)
+	if string(b) != `[]` {
+		t.Fatalf("anon sees %s", b)
+	}
+
+	// The service key bypasses RLS.
+	st, b = svc.do(http.MethodGet, "/rest/v1/itest_todos?select=title", "")
+	expect(t, "service read", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte("alice todo")) {
+		t.Fatalf("service sees %s", b)
+	}
+
+	// Tables without RLS are refused for users, allowed for the service key.
+	st, b = alice.do(http.MethodGet, "/rest/v1/itest_open", "")
+	expect(t, "no-RLS table as user", st, b, http.StatusForbidden)
+	st, b = svc.do(http.MethodGet, "/rest/v1/itest_open", "")
+	expect(t, "no-RLS table as service", st, b, http.StatusOK)
+
+	// Refresh rotates; replaying the old token revokes the session.
+	st, b = anon.do(http.MethodPost, "/auth/v1/token?grant_type=refresh_token", `{"refresh_token":"`+aliceSession.RefreshToken+`"}`)
+	expect(t, "refresh", st, b, http.StatusOK)
+	rotated := decode[session](t, b)
+	st, b = anon.do(http.MethodPost, "/auth/v1/token?grant_type=refresh_token", `{"refresh_token":"`+aliceSession.RefreshToken+`"}`)
+	expect(t, "refresh replay", st, b, http.StatusUnauthorized)
+	if !bytes.Contains(b, []byte("auth.refresh_token_reused")) {
+		t.Fatalf("replay body = %s", b)
+	}
+	st, b = anon.do(http.MethodPost, "/auth/v1/token?grant_type=refresh_token", `{"refresh_token":"`+rotated.RefreshToken+`"}`)
+	expect(t, "refresh after revocation", st, b, http.StatusUnauthorized)
+
+	// Password sign-in and the user endpoint.
+	st, b = anon.do(http.MethodPost, "/auth/v1/token?grant_type=password",
+		`{"email":"bob`+suffix+`@example.com","password":"correct horse battery"}`)
+	expect(t, "password sign-in", st, b, http.StatusOK)
+	st, b = bob.do(http.MethodGet, "/auth/v1/user", "")
+	expect(t, "get user", st, b, http.StatusOK)
+
+	// Logout ends the session.
+	st, b = bob.do(http.MethodPost, "/auth/v1/logout", "")
+	expect(t, "logout", st, b, http.StatusNoContent)
 }

@@ -2,9 +2,11 @@ package kernel
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,10 +14,18 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mini-base/mini-base/internal/platform/authn"
 	"github.com/mini-base/mini-base/internal/platform/httpx"
 	"github.com/mini-base/mini-base/internal/platform/migrate"
 	"github.com/mini-base/mini-base/internal/platform/postgres"
+	"github.com/mini-base/mini-base/pkg/ports"
 )
+
+// coreMigrations are the kernel's own migrations (shared database roles).
+// They run before any module's, recorded under the name "kernel".
+//
+//go:embed migrations/*.sql
+var coreMigrations embed.FS
 
 // Kernel wires configuration, modules, database and HTTP server together
 // and owns the process lifecycle.
@@ -130,6 +140,19 @@ func (k *Kernel) connect(ctx context.Context) (*pgxpool.Pool, error) {
 
 func (k *Kernel) migrate(ctx context.Context, pool *pgxpool.Pool, mods []Module) error {
 	migrator := postgres.NewMigrator(pool, k.log)
+
+	core, err := fs.Sub(coreMigrations, "migrations")
+	if err != nil {
+		return fmt.Errorf("kernel migrations: %w", err)
+	}
+	coreMigs, err := migrate.Load(core)
+	if err != nil {
+		return fmt.Errorf("kernel migrations: %w", err)
+	}
+	if _, err := migrator.Up(ctx, "kernel", coreMigs); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
 	for _, m := range mods {
 		migs, err := migrate.Load(m.Migrations())
 		if err != nil {
@@ -144,6 +167,17 @@ func (k *Kernel) migrate(ctx context.Context, pool *pgxpool.Pool, mods []Module)
 
 func (k *Kernel) initModules(ctx context.Context, mods []Module, pool *pgxpool.Pool, bus EventBus) error {
 	services := NewServices()
+
+	// The token verifier is provided by the auth module during its Init, so
+	// it is looked up per request rather than now.
+	auth := authn.New(authn.Keys{Anon: k.cfg.Keys.Anon, Service: k.cfg.Keys.Service}, func() ports.TokenVerifier {
+		v, ok, _ := Lookup[ports.TokenVerifier](services, ports.TokenVerifierService)
+		if !ok {
+			return nil
+		}
+		return v
+	})
+
 	for _, m := range mods {
 		deps := Deps{
 			Config:   NewModuleConfig(m.Name(), k.getenv),
@@ -152,6 +186,7 @@ func (k *Kernel) initModules(ctx context.Context, mods []Module, pool *pgxpool.P
 			Logger:   k.log.With(slog.String("module", m.Name())),
 			Services: services,
 			Env:      k.cfg.Env,
+			Auth:     auth,
 		}
 		if err := m.Init(ctx, deps); err != nil {
 			return fmt.Errorf("init module %s: %w", m.Name(), err)
@@ -162,7 +197,7 @@ func (k *Kernel) initModules(ctx context.Context, mods []Module, pool *pgxpool.P
 
 func (k *Kernel) buildHandler(mods []Module, pool *pgxpool.Pool) http.Handler {
 	names := make([]string, 0, len(mods))
-	checks := []Check{{Name: "database", Fn: pool.Ping}}
+	checks := []Check{{Name: "postgres", Fn: pool.Ping}}
 	for _, m := range mods {
 		names = append(names, m.Name())
 		if rc, ok := m.(ReadinessChecker); ok {

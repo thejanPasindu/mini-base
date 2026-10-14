@@ -105,3 +105,32 @@ func TestModuleConfigIsScopedAndCollectsErrors(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestLoadConfigValidatesKeys(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("a", 32)
+	tests := map[string]struct {
+		anon, service, want string
+	}{
+		"unset is allowed (modules decide)": {"", "", ""},
+		"too short":                         {"short", long, "ANON_KEY must be at least 32"},
+		"identical":                         {long, long, "must differ"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := kernel.LoadConfig(envFrom(map[string]string{
+				"MINIBASE_DATABASE_URL": "postgres://localhost/db",
+				"MINIBASE_ANON_KEY":     tt.anon,
+				"MINIBASE_SERVICE_KEY":  tt.service,
+			}))
+			switch {
+			case tt.want == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
+				t.Fatalf("err = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}

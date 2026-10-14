@@ -12,6 +12,9 @@ import (
 // EnvPrefix prefixes every environment variable mini-base reads.
 const EnvPrefix = "MINIBASE_"
 
+// minKeyLength mirrors authn.MinKeyLength.
+const minKeyLength = 32
+
 // Environment selects safety defaults.
 type Environment string
 
@@ -28,7 +31,15 @@ type Config struct {
 	HTTP     HTTPConfig
 	Database DatabaseConfig
 	Log      LogConfig
+	Keys     KeysConfig
 	Modules  []string
+}
+
+// KeysConfig holds the API keys checked on every module API request.
+// Both are required by modules that expose an API (auth, database, ...).
+type KeysConfig struct {
+	Anon    string
+	Service string
 }
 
 // HTTPConfig configures the HTTP server.
@@ -88,6 +99,10 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			Level:  e.level("LOG_LEVEL", slog.LevelInfo),
 			Format: e.str("LOG_FORMAT", defaultLogFormat),
 		},
+		Keys: KeysConfig{
+			Anon:    e.str("ANON_KEY", ""),
+			Service: e.str("SERVICE_KEY", ""),
+		},
 		Modules: e.list("MODULES", ""),
 	}
 
@@ -123,6 +138,14 @@ func (c Config) Validate() error {
 	}
 	if c.Log.Format != "json" && c.Log.Format != "text" {
 		errs = append(errs, fmt.Errorf("%sLOG_FORMAT must be \"json\" or \"text\"", EnvPrefix))
+	}
+	for name, key := range map[string]string{"ANON_KEY": c.Keys.Anon, "SERVICE_KEY": c.Keys.Service} {
+		if key != "" && len(key) < minKeyLength {
+			errs = append(errs, fmt.Errorf("%s%s must be at least %d characters (generate with: openssl rand -hex 32)", EnvPrefix, name, minKeyLength))
+		}
+	}
+	if c.Keys.Anon != "" && c.Keys.Anon == c.Keys.Service {
+		errs = append(errs, fmt.Errorf("%sANON_KEY and %sSERVICE_KEY must differ", EnvPrefix, EnvPrefix))
 	}
 	seen := make(map[string]bool, len(c.Modules))
 	for _, m := range c.Modules {

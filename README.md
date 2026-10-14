@@ -4,7 +4,7 @@ A **lightweight, modular, open-source backend** — auth, database REST API, fil
 
 Think Firebase / Supabase, but small enough for a $5 VPS or a Raspberry Pi, and you only turn on what you use.
 
-> 🚧 Status: **Phase 0** (kernel, module system, Docker) is in place. Auth and the database REST API are next. See the [roadmap](docs/architecture.md#10-roadmap).
+> 🚧 Status: **Phase 1** done — accounts and sign-in, plus an automatic REST API over your tables with per-user row level security. File storage is next. See the [roadmap](docs/architecture.md#10-roadmap).
 
 ## Why
 
@@ -19,8 +19,8 @@ Think Firebase / Supabase, but small enough for a $5 VPS or a Raspberry Pi, and 
 | Module | Status | What it gives you |
 |--------|--------|-------------------|
 | `example` | ✅ | Reference module and template for contributors |
-| `auth` | planned | Email/password, magic links, OAuth, JWT sessions |
-| `database` | planned | Auto REST API over your Postgres tables, secured by row-level security |
+| `auth` | ✅ | Email/password sign-up and sign-in, rotating refresh tokens, sessions (OAuth and magic links planned) |
+| `database` | ✅ | Auto REST API over your Postgres tables, secured by row-level security |
 | `storage` | planned | File buckets on local disk or any S3-compatible store |
 | `realtime` | planned | WebSocket subscriptions to table changes, broadcast, presence |
 | `hooks` | planned | Signed webhooks on events, with retries |
@@ -34,16 +34,14 @@ Full walkthrough: [docs/getting-started.md](docs/getting-started.md).
 # 1. One-time: resolve dependencies (writes go.sum). No Go install? use: make tidy-docker
 go mod tidy
 
-# 2. Configure: set POSTGRES_PASSWORD, pick MINIBASE_MODULES
+# 2. Configure: generate the secrets (see docs/getting-started.md, step 4)
 cp deploy/compose/.env.example deploy/compose/.env
 
 # 3. Start minibase + bundled Postgres
 docker compose -f deploy/compose/docker-compose.yml up -d --build
 
-# 4. Try it
+# 4. Check it, then follow the sign-up + REST walkthrough in docs/getting-started.md, step 6
 curl localhost:8090/health/ready
-curl -X POST localhost:8090/example/v1/greetings -H 'Content-Type: application/json' -d '{"message":"hello"}'
-curl localhost:8090/example/v1/greetings
 ```
 
 ### Bundled or your own Postgres
