@@ -17,6 +17,18 @@ type UserRepository interface {
 	// FindByID returns domain.ErrUserNotFound if absent.
 	FindByID(ctx context.Context, id string) (domain.User, error)
 	RecordSignIn(ctx context.Context, id string, at time.Time) error
+	// List returns users whose email contains search (case-insensitive),
+	// newest first, with their number of active sessions at now.
+	List(ctx context.Context, search string, limit, offset int, now time.Time) ([]UserListing, int, error)
+	// Delete removes the user and, by cascade, their sessions.
+	// Returns domain.ErrUserNotFound if absent.
+	Delete(ctx context.Context, id string) error
+}
+
+// UserListing is a user plus their active session count.
+type UserListing struct {
+	User           domain.User
+	ActiveSessions int
 }
 
 // RotateOutcome is the result of presenting a refresh token.
@@ -46,6 +58,9 @@ type SessionRepository interface {
 	Rotate(ctx context.Context, oldHash, newHash []byte, now time.Time) (domain.Session, RotateOutcome, error)
 
 	Revoke(ctx context.Context, sessionID string, at time.Time) error
+
+	// RevokeAll revokes every active session of a user and returns how many.
+	RevokeAll(ctx context.Context, userID string, at time.Time) (int, error)
 
 	// DeleteStale removes sessions expired or revoked before cutoff.
 	DeleteStale(ctx context.Context, cutoff time.Time) (int64, error)

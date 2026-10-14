@@ -173,3 +173,12 @@ func TestDeleteWithoutFilterRefused(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestRLSEnabledAfterSnapshotIsNoticed(t *testing.T) {
+	t.Parallel()
+	s, l, _ := newSvc(t, service.Options{}, open)
+	l.tables = []*domain.Table{domain.NewTable("public", "open", domain.KindTable, true, false, cols)} // RLS enabled in psql
+	if err := read(s, user, "open"); err != nil {
+		t.Fatalf("stale guard should re-check the catalog: %v", err)
+	}
+}

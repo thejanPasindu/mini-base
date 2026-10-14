@@ -79,6 +79,66 @@ func (r *Users) RecordSignIn(ctx context.Context, id string, at time.Time) error
 	return nil
 }
 
+// List implements port.UserRepository.
+func (r *Users) List(ctx context.Context, search string, limit, offset int, now time.Time) ([]port.UserListing, int, error) {
+	pattern := "%" + escapeLike(strings.ToLower(search)) + "%"
+	rows, err := r.db.Query(ctx, `
+		SELECT u.id::text, u.email, u.created_at, u.last_sign_in_at,
+		       (SELECT count(*) FROM auth.sessions s
+		        WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > $4)::int,
+		       count(*) OVER ()::int
+		FROM auth.users u
+		WHERE u.email LIKE $1
+		ORDER BY u.created_at DESC, u.id
+		LIMIT $2 OFFSET $3`, pattern, limit, offset, now)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list users: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		out   []port.UserListing
+		total int
+	)
+	for rows.Next() {
+		var l port.UserListing
+		if err := rows.Scan(&l.User.ID, &l.User.Email, &l.User.CreatedAt, &l.User.LastSignInAt, &l.ActiveSessions, &total); err != nil {
+			return nil, 0, fmt.Errorf("scan user: %w", err)
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list users: %w", err)
+	}
+	if len(out) == 0 && offset > 0 { // past the last page: still report the total
+		if err := r.db.QueryRow(ctx, `SELECT count(*)::int FROM auth.users WHERE email LIKE $1`, pattern).Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("count users: %w", err)
+		}
+	}
+	return out, total, nil
+}
+
+// Delete implements port.UserRepository.
+func (r *Users) Delete(ctx context.Context, id string) error {
+	tag, err := r.db.Exec(ctx, `DELETE FROM auth.users WHERE id = $1::uuid`, id)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "22P02" { // not a uuid
+			return domain.ErrUserNotFound
+		}
+		return fmt.Errorf("delete user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrUserNotFound
+	}
+	return nil
+}
+
+// escapeLike escapes LIKE wildcards so a search for "a_b" is literal.
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
 // Sessions implements port.SessionRepository.
 type Sessions struct{ db *pgxpool.Pool }
 
@@ -168,6 +228,17 @@ func (r *Sessions) Revoke(ctx context.Context, sessionID string, at time.Time) e
 		return fmt.Errorf("revoke session: %w", err)
 	}
 	return nil
+}
+
+// RevokeAll implements port.SessionRepository.
+func (r *Sessions) RevokeAll(ctx context.Context, userID string, at time.Time) (int, error) {
+	tag, err := r.db.Exec(ctx,
+		`UPDATE auth.sessions SET revoked_at = $2 WHERE user_id = $1::uuid AND revoked_at IS NULL AND expires_at > $2`,
+		userID, at)
+	if err != nil {
+		return 0, fmt.Errorf("revoke sessions: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // DeleteStale implements port.SessionRepository.

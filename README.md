@@ -4,7 +4,7 @@ A **lightweight, modular, open-source backend** — auth, database REST API, fil
 
 Think Firebase / Supabase, but small enough for a $5 VPS or a Raspberry Pi, and you only turn on what you use.
 
-> 🚧 Status: **Phase 1** done — accounts and sign-in, plus an automatic REST API over your tables with per-user row level security. File storage is next. See the [roadmap](docs/architecture.md#10-roadmap).
+> 🚧 Status: accounts and sign-in, an automatic REST API over your tables with per-user row level security, and an admin dashboard. File storage is next. See the [roadmap](docs/architecture.md#10-roadmap).
 
 ## Why
 
@@ -12,7 +12,7 @@ Think Firebase / Supabase, but small enough for a $5 VPS or a Raspberry Pi, and 
 |---|---|---|
 | Containers | ~10 | **2** (minibase + Postgres) |
 | Runtimes | Elixir, Go, Node, Haskell, Deno… | **Go** |
-| Pick features | All or nothing | `MINIBASE_MODULES=auth,database` |
+| Pick features | All or nothing | `MINIBASE_MODULES=admin,auth,database` |
 
 ## Modules
 
@@ -24,7 +24,7 @@ Think Firebase / Supabase, but small enough for a $5 VPS or a Raspberry Pi, and 
 | `storage` | planned | File buckets on local disk or any S3-compatible store |
 | `realtime` | planned | WebSocket subscriptions to table changes, broadcast, presence |
 | `hooks` | planned | Signed webhooks on events, with retries |
-| `admin` | planned | Embedded web dashboard |
+| `admin` | ✅ | Web dashboard at `/_/`: table editor, RLS policies, SQL editor, user management |
 
 ## Quick start (Docker)
 

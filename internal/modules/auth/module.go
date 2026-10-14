@@ -23,12 +23,12 @@ import (
 
 	"github.com/mini-base/mini-base/internal/kernel"
 	authhttp "github.com/mini-base/mini-base/internal/modules/auth/adapter/http"
-	"github.com/mini-base/mini-base/internal/modules/auth/adapter/password"
 	authpg "github.com/mini-base/mini-base/internal/modules/auth/adapter/postgres"
 	"github.com/mini-base/mini-base/internal/modules/auth/adapter/token"
 	"github.com/mini-base/mini-base/internal/modules/auth/service"
 	"github.com/mini-base/mini-base/internal/platform/httpx"
 	"github.com/mini-base/mini-base/internal/platform/jwt"
+	"github.com/mini-base/mini-base/internal/platform/password"
 	"github.com/mini-base/mini-base/internal/platform/ratelimit"
 	"github.com/mini-base/mini-base/pkg/ports"
 )
@@ -132,6 +132,10 @@ func (m *Module) Init(_ context.Context, deps kernel.Deps) error {
 
 	// Other modules (database, storage, realtime) verify tokens through this port.
 	if err := deps.Services.Provide(ports.TokenVerifierService, ports.TokenVerifier(tokens)); err != nil {
+		return err
+	}
+	// Operator tools (admin dashboard) manage users through this port.
+	if err := deps.Services.Provide(ports.UserDirectoryService, ports.UserDirectory(directory{svc: svc})); err != nil {
 		return err
 	}
 

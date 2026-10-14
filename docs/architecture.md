@@ -1,6 +1,6 @@
 # mini-base — Architecture Design
 
-> Status: **v0.3 — Phase 1 implemented** · Last updated: 2026-10-14
+> Status: **v0.4 — Phase 1 and the admin dashboard implemented** · Last updated: 2026-10-14
 > Scope: system design for v1. Implementation details live in code and ADRs (`docs/adr/`).
 
 ---
@@ -102,7 +102,7 @@ Supabase runs ~8–10 containers (GoTrue, PostgREST, Realtime, Storage, Kong, St
 | JWT | stdlib (`internal/platform/jwt`, HS256 only) | ~100 lines; refusing every other algorithm avoids the classic `alg` confusion bugs. Asymmetric keys can be added later. |
 | Object storage | Local FS driver, S3 driver (`minio-go`) | Local for small installs, S3/MinIO/R2 when needed. |
 | SDK | TypeScript, zero runtime deps, ESM + CJS | Works in browser, Node, Deno, Bun. |
-| Admin UI | SvelteKit (static build, embedded in binary) | Small bundle; served by the `admin` module. Optional. |
+| Admin UI | Preact + htm (13 KB, vendored), plain CSS, no build step, embedded in the binary | No Node.js toolchain for contributors; tiny; strict CSP-compatible. See §5.7. |
 | Container | Multi-stage build → `gcr.io/distroless/static` | No shell, no package manager; tiny attack surface. |
 
 **Dependency rule:** every third-party library must justify itself. Prefer the standard library.
@@ -229,7 +229,7 @@ Optional (dotted) dependency = the module works without it but gains features wh
 | `storage` | off | `/storage/v1` | `storage` | Buckets + files, local or S3 driver, signed URLs |
 | `realtime` | off | `/realtime/v1` (WS) | `realtime` | DB change streams, broadcast, presence |
 | `hooks` | off | `/hooks/v1` | `hooks` | Outbound webhooks on events, retries |
-| `admin` | off | `/_/` | — | Embedded dashboard + admin API |
+| `admin` | off | `/_/` | `admin` | Web dashboard: tables, RLS, SQL editor, users (✅) |
 | `example` | off | `/example/v1` | `example` | Reference module and template for contributors (Phase 0) |
 
 ---
@@ -376,10 +376,18 @@ One WebSocket endpoint, three channel types (mirrors the Supabase mental model):
 - Uses a Postgres-backed queue (`hooks.deliveries`, `SELECT … FOR UPDATE SKIP LOCKED`) — durable without adding Redis.
 - This is the v1 answer to "cloud functions": your logic lives in your own service; mini-base calls it.
 
-### 5.7 `admin`
+### 5.7 `admin` — ✅ dashboard (built ahead of storage and realtime)
 
-- Embedded static dashboard (tables browser, users, buckets, policies, logs) + `/_/api` admin endpoints.
-- Requires the `service` key or an admin user; disabled by default and should be put behind a private network in production.
+Web dashboard at `/_/` with a JSON API at `/_/api`. Pages: **Overview** (server, database, tables without RLS), **Tables** (browse, sort, page; add, edit and delete rows by primary key; structure; turn RLS on or off; policies), **SQL editor**, **Users** (when `auth` is enabled).
+
+- **Frontend without a build step.** Plain HTML, CSS and ES modules embedded in the binary with `embed.FS`. The only third-party code is the 13 KB Preact + htm bundle, vendored with its licence and checksum (`web/assets/vendor`). No Node.js is needed to build or contribute.
+- **Separate operator accounts** in the module's own `admin` schema (Argon2id, at least 12 characters), created with `minibase admin create` or bootstrapped from `MINIBASE_ADMIN_EMAIL` / `_PASSWORD` when none exist. They work with or without the `auth` module.
+- **Sessions** are random 256-bit tokens stored hashed, in an `HttpOnly`, `SameSite=Strict` cookie scoped to `/_/` (12 h). Changing a password ends every session. Sign-in is rate-limited per IP and takes the same time for unknown emails.
+- **CSRF defence in depth:** every write needs the `X-Minibase-Admin` header (custom headers force a CORS preflight the server never grants), and is refused if `Sec-Fetch-Site` is `cross-site` or `Origin` doesn't match the host.
+- **Strict CSP:** `script-src 'self'`, no inline script, `frame-ancestors 'none'`.
+- **SQL editor** runs as the connection user on a connection *removed from the pool and closed afterwards*, so `SET ROLE`, `search_path` changes or open transactions cannot leak into API traffic. Each script has a statement timeout (30 s), results are capped (500 rows per statement), and every run is logged with the admin's email.
+- **Table editor** binds every value and converts it with the column's type via `json_populate_record`. It identifies rows by primary key (tables without one are read-only), refuses writes to generated columns, and hides internal schemas (`auth`, `admin`, `minibase`, …).
+- **Module boundaries:** user management goes through `ports.UserDirectory` (provided by `auth`), never `auth.*` tables. Schema edits publish `ports.EventSchemaChanged`, which makes the `database` module reload its catalog cache. `database` also re-checks the catalog once before refusing a table it believes has no RLS.
 
 ---
 
@@ -415,7 +423,7 @@ mini-base/
 │   │   ├── storage/
 │   │   ├── realtime/
 │   │   ├── hooks/
-│   │   └── admin/
+│   │   └── admin/           # dashboard; web/ holds the embedded UI (no build step)
 │   └── platform/
 │       ├── errs/            # typed application errors (Kind + stable Code)
 │       ├── httpx/           # router, middleware, JSON + error responses
@@ -426,8 +434,6 @@ mini-base/
 ├── api/                     # OpenAPI specs
 ├── sdk/
 │   └── js/                  # @minibase/js client
-├── web/
-│   └── admin/               # admin dashboard source (built into internal/modules/admin/dist)
 ├── deploy/
 │   ├── docker/Dockerfile
 │   ├── compose/docker-compose.yml
@@ -516,7 +522,8 @@ CI (GitHub Actions): lint → unit → integration → build image → e2e → p
 | **1 — Auth + Database** ✅ | Email/password, JWT, refresh rotation, API keys; REST CRUD with RLS | SDK can sign up and CRUD its own rows; another user cannot read them |
 | **2 — Storage** | Buckets, local driver, signed URLs, RLS on objects; S3 driver | Upload/download via SDK with policies |
 | **3 — Realtime** | WS hub, db change channels, broadcast, presence | SDK receives inserts on a table filtered by RLS |
-| **4 — DX** | JS SDK v1, admin dashboard, docs site, OAuth providers, magic link | New user to working app in < 10 minutes |
+| **Dashboard** ✅ | `admin` module, built early (ahead of Phases 2–3) | Manage tables, RLS, SQL and users from the browser |
+| **4 — DX** | JS SDK v1, docs site, OAuth providers, magic link; storage and realtime pages in the dashboard | New user to working app in < 10 minutes |
 | **5 — Extensions** | `hooks` module, Prometheus metrics, logical-replication change source | — |
 
 ---

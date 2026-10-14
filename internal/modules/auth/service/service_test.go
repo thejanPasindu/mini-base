@@ -63,6 +63,36 @@ func (m *memUsers) FindByID(_ context.Context, id string) (domain.User, error) {
 
 func (m *memUsers) RecordSignIn(context.Context, string, time.Time) error { return nil }
 
+func (m *memUsers) List(_ context.Context, search string, limit, offset int, _ time.Time) ([]port.UserListing, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var all []port.UserListing
+	for _, u := range m.byID {
+		if strings.Contains(u.Email, search) {
+			all = append(all, port.UserListing{User: u})
+		}
+	}
+	total := len(all)
+	if offset > len(all) {
+		offset = len(all)
+	}
+	all = all[offset:]
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, total, nil
+}
+
+func (m *memUsers) Delete(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.byID[id]; !ok {
+		return domain.ErrUserNotFound
+	}
+	delete(m.byID, id)
+	return nil
+}
+
 type memToken struct {
 	hash    []byte
 	session string
@@ -114,6 +144,19 @@ func (m *memSessions) Revoke(_ context.Context, id string, at time.Time) error {
 		s.RevokedAt = &at
 	}
 	return nil
+}
+
+func (m *memSessions) RevokeAll(_ context.Context, userID string, at time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, s := range m.sessions {
+		if s.UserID == userID && s.Active(at) {
+			s.RevokedAt = &at
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (m *memSessions) DeleteStale(context.Context, time.Time) (int64, error) { return 0, nil }
@@ -286,5 +329,38 @@ func TestSignOutRevokesSession(t *testing.T) {
 	}
 	if _, err := f.svc.Refresh(ctx, res.RefreshToken); !errors.Is(err, domain.ErrSessionExpired) {
 		t.Fatalf("refresh after sign-out: %v", err)
+	}
+}
+
+func TestOperatorUserManagement(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, func(o *service.Options) { o.AllowSignup = false })
+
+	u, err := f.svc.CreateUser(ctx, "Op@Example.com", "correct horse")
+	if err != nil {
+		t.Fatalf("operators can add users even when sign-up is closed: %v", err)
+	}
+	if _, err := f.svc.CreateUser(ctx, "x@example.com", "short"); !errors.Is(err, domain.ErrWeakPassword) {
+		t.Fatalf("password policy still applies: %v", err)
+	}
+
+	list, total, err := f.svc.ListUsers(ctx, "op@", 10, 0)
+	if err != nil || total != 1 || list[0].User.ID != u.ID {
+		t.Fatalf("list = %v total=%d err=%v", list, total, err)
+	}
+
+	res, _ := f.svc.SignInWithPassword(ctx, "op@example.com", "correct horse", domain.ClientInfo{})
+	if n, err := f.svc.RevokeUserSessions(ctx, u.ID); err != nil || n != 1 {
+		t.Fatalf("revoked %d, err %v", n, err)
+	}
+	if _, err := f.svc.Refresh(ctx, res.RefreshToken); !errors.Is(err, domain.ErrSessionExpired) {
+		t.Fatalf("refresh after revoke: %v", err)
+	}
+
+	if err := f.svc.DeleteUser(ctx, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.svc.DeleteUser(ctx, u.ID); !errors.Is(err, domain.ErrUserNotFound) {
+		t.Fatalf("second delete: %v", err)
 	}
 }

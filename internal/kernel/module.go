@@ -73,6 +73,16 @@ type Deps struct {
 	// Auth authenticates API requests (API key + optional access token).
 	// Wrap API routes with Auth.Middleware(); call RequireKeys in Init.
 	Auth *authn.Authenticator
+
+	// Info describes the running server (for status pages).
+	Info RuntimeInfo
+}
+
+// RuntimeInfo describes the running server.
+type RuntimeInfo struct {
+	Version string
+	Env     Environment
+	Modules []string // enabled modules, in start order
 }
 
 // RequireKeys returns an error explaining how to configure API keys when

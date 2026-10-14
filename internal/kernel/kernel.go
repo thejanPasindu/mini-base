@@ -83,6 +83,32 @@ func (k *Kernel) Migrate(ctx context.Context) error {
 	return k.migrate(ctx, pool, mods)
 }
 
+// WithDB connects, applies migrations for the enabled modules and calls fn
+// with the pool. It is for CLI commands such as `minibase admin create`.
+func (k *Kernel) WithDB(ctx context.Context, fn func(ctx context.Context, db *pgxpool.Pool) error) error {
+	mods, err := k.registry.Resolve(k.cfg.Modules)
+	if err != nil {
+		return err
+	}
+	pool, err := k.connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := k.migrate(ctx, pool, mods); err != nil {
+		return err
+	}
+	return fn(ctx, pool)
+}
+
+func moduleNames(mods []Module) []string {
+	names := make([]string, len(mods))
+	for i, m := range mods {
+		names[i] = m.Name()
+	}
+	return names
+}
+
 // Run starts everything and blocks until ctx is cancelled (SIGTERM) or the
 // server fails, then shuts down gracefully.
 func (k *Kernel) Run(ctx context.Context) error {
@@ -178,6 +204,7 @@ func (k *Kernel) initModules(ctx context.Context, mods []Module, pool *pgxpool.P
 		return v
 	})
 
+	info := RuntimeInfo{Version: k.version, Env: k.cfg.Env, Modules: moduleNames(mods)}
 	for _, m := range mods {
 		deps := Deps{
 			Config:   NewModuleConfig(m.Name(), k.getenv),
@@ -187,6 +214,7 @@ func (k *Kernel) initModules(ctx context.Context, mods []Module, pool *pgxpool.P
 			Services: services,
 			Env:      k.cfg.Env,
 			Auth:     auth,
+			Info:     info,
 		}
 		if err := m.Init(ctx, deps); err != nil {
 			return fmt.Errorf("init module %s: %w", m.Name(), err)

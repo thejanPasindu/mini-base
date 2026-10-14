@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mini-base/mini-base/internal/modules/auth/adapter/password"
+	"github.com/mini-base/mini-base/internal/platform/password"
 )
 
 // Small parameters keep tests fast; production uses DefaultParams.

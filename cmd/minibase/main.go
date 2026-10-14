@@ -3,6 +3,7 @@
 //	minibase serve        start the server (default)
 //	minibase migrate      apply migrations for enabled modules and exit
 //	minibase modules      list modules compiled into this binary
+//	minibase admin ...    manage dashboard admin accounts
 //	minibase healthcheck  probe /health/live (for Docker HEALTHCHECK)
 //	minibase version      print the version
 package main
@@ -48,6 +49,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		for _, name := range registry().Names() {
 			fmt.Fprintln(stdout, name)
 		}
+	case "admin":
+		err = adminCmd(ctx, args, getenv, os.Stdin, stdout, stderr)
 	case "healthcheck":
 		err = healthcheck(ctx, getenv)
 	case "version":
@@ -76,6 +79,7 @@ Commands:
   serve        Start the server (default)
   migrate      Apply migrations for enabled modules and exit
   modules      List modules compiled into this binary
+  admin        Manage dashboard admins (create, list, delete, reset-password)
   healthcheck  Exit 0 if the local server is live
   version      Print the version
 

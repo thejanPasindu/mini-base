@@ -58,6 +58,15 @@ func (s *Service) Reload(ctx context.Context) error {
 	return nil
 }
 
+// Invalidate forces the next request to see a fresh catalog. Call it when
+// the schema is known to have changed (ports.EventSchemaChanged).
+func (s *Service) Invalidate(ctx context.Context) error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	s.reloaded = s.now()
+	return s.Reload(ctx)
+}
+
 // Ready implements a readiness probe: the schema must have loaded.
 func (s *Service) Ready(context.Context) error {
 	if s.schema.Load() == nil {
@@ -149,7 +158,17 @@ func (s *Service) run(ctx context.Context, r Request, build func(*domain.Table) 
 		return Response{}, err
 	}
 	if err := s.authorize(r.Principal, t); err != nil {
-		return Response{}, err
+		// RLS may have been enabled since the snapshot was taken (e.g. in
+		// psql). Re-check once against a fresh catalog before refusing.
+		if !s.maybeReload(ctx) {
+			return Response{}, err
+		}
+		if st, t, err = s.prepare(r.Table, build); err != nil {
+			return Response{}, err
+		}
+		if err := s.authorize(r.Principal, t); err != nil {
+			return Response{}, err
+		}
 	}
 
 	if st.Returns {

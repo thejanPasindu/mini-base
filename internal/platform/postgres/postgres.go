@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -50,6 +51,11 @@ func Connect(ctx context.Context, opts Options, log *slog.Logger) (*pgxpool.Pool
 				slog.String("host", cfg.ConnConfig.Host), slog.String("database", cfg.ConnConfig.Database))
 			return pool, nil
 		}
+		// Retrying cannot fix wrong credentials or a missing database.
+		if hint := permanentFailure(pingErr); hint != "" {
+			pool.Close()
+			return nil, fmt.Errorf("%s: %w", hint, pingErr)
+		}
 		log.WarnContext(ctx, "database not ready, retrying",
 			slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", pingErr))
 
@@ -61,4 +67,22 @@ func Connect(ctx context.Context, opts Options, log *slog.Logger) (*pgxpool.Pool
 		}
 		backoff = min(backoff*2, 5*time.Second)
 	}
+}
+
+// permanentFailure returns a hint for connection errors that retrying will
+// not fix, or "" for errors worth retrying (server still starting, network).
+func permanentFailure(err error) string {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return ""
+	}
+	switch pgErr.Code {
+	case "28P01", "28000": // invalid_password, invalid_authorization_specification
+		return "database rejected the credentials. With the bundled Postgres, the password is fixed " +
+			"when its data volume is first created, so changing POSTGRES_PASSWORD later has no effect. " +
+			"See docs/getting-started.md, Troubleshooting"
+	case "3D000": // invalid_catalog_name
+		return "database does not exist; check the database name in MINIBASE_DATABASE_URL"
+	}
+	return ""
 }

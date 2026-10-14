@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mini-base/mini-base/internal/modules/auth/domain"
@@ -198,6 +199,67 @@ func (s *Service) GetUser(ctx context.Context, id string) (domain.User, error) {
 		return domain.User{}, fmt.Errorf("get user: %w", err)
 	}
 	return u, nil
+}
+
+// EventUserDeleted is published after an operator deletes a user.
+const EventUserDeleted = "auth.user.deleted"
+
+// ListUsers returns a page of users for operators.
+func (s *Service) ListUsers(ctx context.Context, search string, limit, offset int) ([]port.UserListing, int, error) {
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	users, total, err := s.users.List(ctx, strings.TrimSpace(search), limit, offset, s.now())
+	if err != nil {
+		return nil, 0, fmt.Errorf("list users: %w", err)
+	}
+	return users, total, nil
+}
+
+// CreateUser creates an account on behalf of an operator. It ignores
+// AllowSignup (operators may add users to a closed app) and starts no session.
+func (s *Service) CreateUser(ctx context.Context, email, password string) (domain.User, error) {
+	email, err := domain.NormalizeEmail(email)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if err := domain.ValidatePassword(password, s.opts.PasswordMinLength); err != nil {
+		return domain.User{}, err
+	}
+	hash, err := s.hasher.Hash(ctx, password)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("hash password: %w", err)
+	}
+	user, err := s.users.Create(ctx, email, hash)
+	if err != nil {
+		return domain.User{}, fmt.Errorf("create user: %w", err)
+	}
+	s.events.Publish(ctx, EventUserCreated, user)
+	return user, nil
+}
+
+// DeleteUser removes a user and all their sessions.
+func (s *Service) DeleteUser(ctx context.Context, id string) error {
+	if err := s.users.Delete(ctx, id); err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
+	s.events.Publish(ctx, EventUserDeleted, map[string]string{"user_id": id})
+	return nil
+}
+
+// RevokeUserSessions signs a user out everywhere.
+func (s *Service) RevokeUserSessions(ctx context.Context, userID string) (int, error) {
+	n, err := s.sessions.RevokeAll(ctx, userID, s.now())
+	if err != nil {
+		return 0, fmt.Errorf("revoke sessions: %w", err)
+	}
+	if n > 0 {
+		s.events.Publish(ctx, EventSessionRevoked, map[string]string{"user_id": userID, "reason": "revoked_by_admin"})
+	}
+	return n, nil
 }
 
 // PurgeStaleSessions deletes sessions that expired or were revoked more than

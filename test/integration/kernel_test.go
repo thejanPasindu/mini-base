@@ -15,7 +15,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mini-base/mini-base/internal/kernel"
+	"github.com/mini-base/mini-base/internal/modules/admin"
 	"github.com/mini-base/mini-base/internal/modules/auth"
 	"github.com/mini-base/mini-base/internal/modules/database"
 	"github.com/mini-base/mini-base/internal/modules/example"
@@ -45,7 +48,7 @@ func testDatabaseURL(t *testing.T) string {
 
 func registry() *kernel.Registry {
 	r := kernel.NewRegistry()
-	r.MustRegister(auth.New(), database.New(), example.New())
+	r.MustRegister(admin.New(), auth.New(), database.New(), example.New())
 	return r
 }
 
@@ -60,6 +63,8 @@ func envFunc(t *testing.T, modules string) func(string) string {
 		"MINIBASE_AUTH_JWT_SECRET":            jwtSecret,
 		"MINIBASE_AUTH_RATE_LIMIT_PER_MINUTE": "0",
 		"MINIBASE_DATABASE_STATEMENT_TIMEOUT": "5s",
+		"MINIBASE_ADMIN_EMAIL":                "itest-admin@example.com",
+		"MINIBASE_ADMIN_PASSWORD":             "itest admin password",
 	}
 	return func(k string) string { return env[k] }
 }
@@ -318,4 +323,109 @@ func TestPhase1(t *testing.T) {
 	// Logout ends the session.
 	st, b = bob.do(http.MethodPost, "/auth/v1/logout", "")
 	expect(t, "logout", st, b, http.StatusNoContent)
+}
+
+// TestAdminDashboard drives the dashboard API: bootstrap admin, sign-in,
+// SQL editor, RLS toggle, row editing and user management.
+func TestAdminDashboard(t *testing.T) {
+	base := startKernel(t, "admin,auth,database")
+	jar, _ := cookiejar.New(nil)
+	hc := &http.Client{Jar: jar}
+
+	call := func(method, path, body string) (int, []byte) {
+		t.Helper()
+		req, _ := http.NewRequest(method, base+"/_/api"+path, strings.NewReader(body))
+		req.Header.Set("X-Minibase-Admin", "1")
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := hc.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, b
+	}
+
+	st, b := call(http.MethodGet, "/overview", "")
+	expect(t, "overview before sign-in", st, b, http.StatusUnauthorized)
+
+	st, b = call(http.MethodPost, "/login", `{"email":"itest-admin@example.com","password":"itest admin password"}`)
+	expect(t, "admin sign-in (bootstrapped from env)", st, b, http.StatusOK)
+
+	st, b = call(http.MethodPost, "/sql", `{"query":"DROP TABLE IF EXISTS public.itest_notes; CREATE TABLE public.itest_notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, body text NOT NULL, meta jsonb); SELECT 1 AS one"}`)
+	expect(t, "sql editor", st, b, http.StatusOK)
+	run := decode[struct {
+		Results []struct{ Command string } `json:"results"`
+		Error   *struct{ Message string }  `json:"error"`
+	}](t, b)
+	if run.Error != nil || len(run.Results) != 3 || run.Results[2].Command != "SELECT 1" {
+		t.Fatalf("sql run = %s", b)
+	}
+
+	st, b = call(http.MethodPost, "/sql", `{"query":"SELECT * FROM no_such_table"}`)
+	expect(t, "sql error is a result, not a failure", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte("does not exist")) {
+		t.Fatalf("sql error = %s", b)
+	}
+
+	st, b = call(http.MethodGet, "/overview", "")
+	expect(t, "overview", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte("itest_notes")) {
+		t.Fatalf("new table without RLS should be flagged: %s", b)
+	}
+
+	st, b = call(http.MethodPost, "/tables/public/itest_notes/rls", `{"enabled":true}`)
+	expect(t, "enable rls", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte(`"rls_enabled":true`)) {
+		t.Fatalf("rls = %s", b)
+	}
+
+	st, b = call(http.MethodPost, "/tables/public/itest_notes/rows", `{"values":{"body":"hello","meta":{"a":1}}}`)
+	expect(t, "insert row", st, b, http.StatusCreated)
+	row := decode[struct {
+		Row struct {
+			ID   int64          `json:"id"`
+			Meta map[string]int `json:"meta"`
+		} `json:"row"`
+	}](t, b)
+	if row.Row.Meta["a"] != 1 {
+		t.Fatalf("jsonb not stored as JSON: %s", b)
+	}
+	key := `{"id":` + strconv.FormatInt(row.Row.ID, 10) + `}`
+
+	st, b = call(http.MethodPatch, "/tables/public/itest_notes/rows", `{"key":`+key+`,"values":{"body":"edited"}}`)
+	expect(t, "update row", st, b, http.StatusOK)
+	st, b = call(http.MethodGet, "/tables/public/itest_notes/rows?limit=10", "")
+	expect(t, "browse", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte(`"body":"edited"`)) || !bytes.Contains(b, []byte(`"total":1`)) {
+		t.Fatalf("browse = %s", b)
+	}
+	st, b = call(http.MethodDelete, "/tables/public/itest_notes/rows", `{"key":`+key+`}`)
+	expect(t, "delete row", st, b, http.StatusOK)
+	st, b = call(http.MethodDelete, "/tables/public/itest_notes/rows", `{"key":`+key+`}`)
+	expect(t, "delete again", st, b, http.StatusNotFound)
+
+	st, b = call(http.MethodGet, "/tables/auth/users", "")
+	expect(t, "internal schemas are hidden", st, b, http.StatusNotFound)
+
+	email := "dash" + time.Now().Format("150405.000000") + "@example.com"
+	st, b = call(http.MethodPost, "/users", `{"email":"`+email+`","password":"correct horse battery"}`)
+	expect(t, "create user", st, b, http.StatusCreated)
+	user := decode[struct {
+		User struct{ ID string } `json:"user"`
+	}](t, b)
+	st, b = call(http.MethodGet, "/users?search="+email, "")
+	expect(t, "search users", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte(`"total":1`)) {
+		t.Fatalf("search = %s", b)
+	}
+	st, b = call(http.MethodDelete, "/users/"+user.User.ID, "")
+	expect(t, "delete user", st, b, http.StatusNoContent)
+
+	st, b = call(http.MethodPost, "/logout", "")
+	expect(t, "logout", st, b, http.StatusNoContent)
+	st, b = call(http.MethodGet, "/me", "")
+	expect(t, "after logout", st, b, http.StatusUnauthorized)
 }

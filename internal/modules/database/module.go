@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -23,13 +24,14 @@ import (
 	dbpg "github.com/mini-base/mini-base/internal/modules/database/adapter/postgres"
 	"github.com/mini-base/mini-base/internal/modules/database/service"
 	"github.com/mini-base/mini-base/internal/platform/httpx"
+	"github.com/mini-base/mini-base/pkg/ports"
 )
 
 //go:embed migrations/*.sql
 var migrations embed.FS
 
 // Schemas owned by mini-base or Postgres that must never be exposed.
-var reservedSchemas = []string{"auth", "minibase", "storage", "realtime", "hooks", "example", "pg_catalog", "information_schema", "pg_toast"}
+var reservedSchemas = []string{"auth", "admin", "minibase", "storage", "realtime", "hooks", "example", "pg_catalog", "information_schema", "pg_toast"}
 
 // Module wires the database feature into the kernel.
 type Module struct {
@@ -101,6 +103,13 @@ func (m *Module) Init(ctx context.Context, deps kernel.Deps) error {
 		return err
 	}
 	m.handler = dbhttp.NewHandler(m.svc, deps.Auth, deps.Logger)
+
+	// The admin dashboard announces schema edits; refresh the cache at once.
+	deps.Bus.Subscribe(ports.EventSchemaChanged, func(ctx context.Context, _ kernel.Event) {
+		if err := m.svc.Invalidate(ctx); err != nil {
+			deps.Logger.WarnContext(ctx, "reload schema after change", slog.Any("error", err))
+		}
+	})
 	return nil
 }
 

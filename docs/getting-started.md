@@ -10,7 +10,7 @@ Commands are for macOS/Linux Terminal and start from the repository root unless 
 3. [Run the unit tests](#3-run-the-unit-tests)
 4. [Configure](#4-configure)
 5. [Start mini-base and Postgres](#5-start-mini-base-and-postgres)
-6. [Try the API](#6-try-the-api)
+6. [Try the API](#6-try-the-api), then [open the admin dashboard](#6b-open-the-admin-dashboard)
 7. [Look inside Postgres](#7-look-inside-postgres)
 8. [Logs, stop, reset](#8-logs-stop-reset)
 9. [Integration tests](#9-integration-tests)
@@ -26,7 +26,7 @@ There are two independent switches, both in `deploy/compose/.env`:
 
 | Setting | What it controls | Example |
 |---|---|---|
-| `MINIBASE_MODULES` | Features **inside** the minibase program | `auth,database` (available: `auth`, `database`, `example`) |
+| `MINIBASE_MODULES` | Features **inside** the minibase program | `admin,auth,database` (available: `admin`, `auth`, `database`, `example`) |
 | `COMPOSE_PROFILES` | Extra **containers** started next to it | `db` = bundled PostgreSQL (default), `dev` = Mailpit, `s3` = MinIO |
 
 PostgreSQL is not a mini-base module: modules are code inside the binary, while Postgres is a separate server that can run next to minibase or anywhere else. That is why it is switched with a Compose profile, and why it is never built into the minibase image.
@@ -80,7 +80,7 @@ done
 grep -E "^(COMPOSE_PROFILES|MINIBASE_MODULES|POSTGRES_PASSWORD|MINIBASE_.*KEY|MINIBASE_AUTH_JWT_SECRET)=" .env
 ```
 
-✅ Shows `COMPOSE_PROFILES=db`, `MINIBASE_MODULES=auth,database`, and four different 64-character secrets. No `change-me` is left.
+✅ Shows `COMPOSE_PROFILES=db`, `MINIBASE_MODULES=admin,auth,database`, and four different 64-character secrets. No `change-me` is left.
 
 > ⚠️ **Already started the stack before?** Keep your old `POSTGRES_PASSWORD`. The bundled Postgres sets its password only when its data volume is first created; a new value in `.env` makes mini-base fail with `password authentication failed`. Copy the old value back, or see Troubleshooting.
 
@@ -204,6 +204,39 @@ PATCH and DELETE need at least one filter, so a whole table is never changed by 
 
 The `example` module still works if you add it to `MINIBASE_MODULES` (`auth,database,example`).
 
+## 6b. Open the admin dashboard
+
+The dashboard runs inside mini-base when `admin` is in `MINIBASE_MODULES`. Its admins are separate from your app's users.
+
+**Create your admin account** (from `deploy/compose`):
+
+```bash
+docker compose exec minibase /minibase admin create --email you@example.com
+```
+
+✅ Prints `Admin you@example.com created.` and a generated password. It is shown only once, so save it in your password manager.
+
+Open **http://localhost:8090/_/** and sign in.
+
+| Page | What you can do |
+|---|---|
+| Overview | Version, modules, database size, and which tables are **not** protected by row level security |
+| Tables | Browse, sort and page rows; add, edit and delete rows (tables with a primary key); see columns; turn RLS on or off; read policies |
+| SQL editor | Run any SQL as the database owner, e.g. create tables and policies. Several statements at once; `Ctrl`/`⌘` + `Enter` runs them |
+| Users | Search app users, add one, sign a user out everywhere, delete a user (needs the `auth` module) |
+
+Tables without row level security are marked with an amber striped square, and their page shows a **Turn on row level security** button.
+
+Other admin commands:
+
+```bash
+docker compose exec minibase /minibase admin list
+docker compose exec minibase /minibase admin reset-password --email you@example.com
+docker compose exec minibase /minibase admin delete --email someone@example.com
+```
+
+> The SQL editor bypasses row level security, so admin accounts are powerful. Admin passwords need at least 12 characters. When you expose the dashboard over HTTPS, set `MINIBASE_ADMIN_SECURE_COOKIE=true`. To drop the dashboard entirely, remove `admin` from `MINIBASE_MODULES`: `/_/` then returns 404.
+
 ## 7. Look inside Postgres
 
 From `deploy/compose`:
@@ -315,6 +348,9 @@ mini-base creates its own schemas (`minibase`, plus one per enabled module) on f
 
 | Symptom | Cause and fix |
 |---|---|
+| Dashboard says "Sign in" but you have no account | Create one: `docker compose exec minibase /minibase admin create --email you@example.com` |
+| Dashboard sign-in loops back to the sign-in page | You set `MINIBASE_ADMIN_SECURE_COOKIE=true` but opened the dashboard over plain `http://`. Use HTTPS, or set it back to `false` for local use. |
+| `Too many attempts` on the dashboard sign-in | Login is limited to 10 attempts per minute per IP. Wait a minute. |
 | `MINIBASE_ANON_KEY and MINIBASE_SERVICE_KEY must be set` at startup | Step 4 was skipped or `.env` still says `change-me`. Generate the keys and restart. |
 | `MINIBASE_AUTH_JWT_SECRET must be at least 32 characters` | Same: generate it with `openssl rand -hex 32`. |
 | `permission denied to create role` at startup | The database user needs `CREATEROLE` (or superuser): mini-base creates the `minibase_anon` and `minibase_authenticated` roles. |
