@@ -28,6 +28,8 @@ Think Firebase / Supabase, but small enough for a $5 VPS or a Raspberry Pi, and 
 
 ## Quick start (Docker)
 
+Full walkthrough: [docs/getting-started.md](docs/getting-started.md).
+
 ```bash
 # 1. One-time: resolve dependencies (writes go.sum). No Go install? use: make tidy-docker
 go mod tidy
@@ -71,6 +73,7 @@ Configuration is environment variables prefixed `MINIBASE_` — see [`deploy/com
 
 ## Docs
 
+- [Getting started](docs/getting-started.md) — step-by-step setup, everyday commands, troubleshooting
 - [Architecture](docs/architecture.md)
 - [Coding standards](docs/coding-standards.md)
 - [Contributing](CONTRIBUTING.md)
