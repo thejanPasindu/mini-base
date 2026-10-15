@@ -221,13 +221,28 @@ Open **http://localhost:8090/_/** and sign in.
 | Page | What you can do |
 |---|---|
 | Overview | Version, modules, database size, and which tables are **not** protected by row level security |
-| Tables | Browse, sort and page rows; add, edit and delete rows (tables with a primary key); see columns; turn RLS on or off; read policies |
-| SQL editor | Run any SQL as the database owner, e.g. create tables and policies. Several statements at once; `Ctrl`/`⌘` + `Enter` runs them |
+| Tables | Browse, **filter**, sort and page rows; add, edit and delete rows (tables with a primary key); **export and import CSV**; **create tables**, add and drop columns; turn RLS on or off; **add policies from templates**; see **API examples** for the table |
+| SQL editor | Run any SQL as the database owner. Several statements at once; `Ctrl`/`⌘` + `Enter` runs them. **Save snippets** and reopen recent runs from **History** |
 | Users | Search app users, add one, sign a user out everywhere, delete a user (needs the `auth` module) |
+| API and keys | Your URL and anon key with copy buttons, the service key (masked), sign-up and sign-in examples |
+| Audit log | Who did what: sign-ins, SQL runs, schema and policy changes, row edits, imports and exports |
+| Admins | Add admins (a password can be generated), reset passwords, sign admins out, remove them |
+| Settings | Every `MINIBASE_*` setting in effect and whether it came from `.env` or a default. Secrets are hidden |
 
 Tables without row level security are marked with an amber striped square, and their page shows a **Turn on row level security** button.
 
-Other admin commands:
+**Try it: build the todo table from step 6 without SQL**
+
+1. **Tables → New.** Name it `todos2`. Leave the primary key on "a number the database assigns".
+2. Add a column `title`, type `text`, tick **Required**.
+3. Click **Add owner column (user_id)**. It's a `uuid`, defaults to `auth.uid()` (the signed-in user), and links to `auth.users` so a user's rows go when the user is deleted.
+4. Keep **Turn on row level security** ticked. The box at the bottom shows the exact SQL. Click **Create table**.
+5. You land on **Policies**. Pick **Owners manage their own rows** and click **Add policy**.
+6. Open the **API** tab for ready-to-paste `curl` and JavaScript calls. With Alice's token from step 6.3 they work straight away, and Bob still sees `[]`.
+
+**CSV files.** Export follows the filters and sort you have on screen. Import expects a header row naming columns. Columns the database fills in (like `id` above) are skipped, so an exported file can be imported again. Empty cells become null unless you untick that option. Imports are all or nothing: if one row fails, none are added and the error says which lines to look at. The file size limit is `MINIBASE_HTTP_MAX_BODY_BYTES` (10 MB by default).
+
+Admins can also be managed on the **Admins** page. The commands below are for the server, for example when everyone is locked out:
 
 ```bash
 docker compose exec minibase /minibase admin list
@@ -235,7 +250,7 @@ docker compose exec minibase /minibase admin reset-password --email you@example.
 docker compose exec minibase /minibase admin delete --email someone@example.com
 ```
 
-> The SQL editor bypasses row level security, so admin accounts are powerful. Admin passwords need at least 12 characters. When you expose the dashboard over HTTPS, set `MINIBASE_ADMIN_SECURE_COOKIE=true`. To drop the dashboard entirely, remove `admin` from `MINIBASE_MODULES`: `/_/` then returns 404.
+> The SQL editor bypasses row level security, so admin accounts are powerful. Admin passwords need at least 12 characters. Everything admins do is in the **Audit log**, kept for 90 days (`MINIBASE_ADMIN_AUDIT_RETENTION`, `0` keeps everything). When you expose the dashboard over HTTPS, set `MINIBASE_ADMIN_SECURE_COOKIE=true`. To drop the dashboard entirely, remove `admin` from `MINIBASE_MODULES`: `/_/` then returns 404.
 
 ## 7. Look inside Postgres
 

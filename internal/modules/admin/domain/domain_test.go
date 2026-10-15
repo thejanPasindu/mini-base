@@ -34,7 +34,7 @@ func TestPasswordPolicy(t *testing.T) {
 
 func TestBrowseOrdersByPrimaryKey(t *testing.T) {
 	t.Parallel()
-	st, err := domain.BuildBrowse(todos(), nil, 50, 100)
+	st, err := domain.BuildBrowse(todos(), nil, nil, 50, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestBrowseOrdersByPrimaryKey(t *testing.T) {
 	if st.SQL != want || st.Args[0] != 50 || st.Args[1] != 100 {
 		t.Fatalf("sql = %s args = %v", st.SQL, st.Args)
 	}
-	if _, err := domain.BuildBrowse(todos(), &domain.SortTerm{Column: `x"; drop`}, 1, 0); err == nil {
+	if _, err := domain.BuildBrowse(todos(), nil, &domain.SortTerm{Column: `x"; drop`}, 1, 0); err == nil {
 		t.Fatal("unknown sort column accepted")
 	}
 }

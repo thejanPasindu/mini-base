@@ -102,30 +102,6 @@ type SortTerm struct {
 	Desc   bool
 }
 
-// BuildBrowse selects a page of rows as a JSON array. Without an explicit
-// sort, rows are ordered by primary key so paging is stable.
-func BuildBrowse(t *Table, sort *SortTerm, limit, offset int) (Statement, error) {
-	order := ""
-	switch {
-	case sort != nil:
-		if _, ok := t.column(sort.Column); !ok {
-			return Statement{}, unknownColumn(sort.Column)
-		}
-		dir := "ASC"
-		if sort.Desc {
-			dir = "DESC"
-		}
-		order = " ORDER BY " + QuoteIdent(sort.Column) + " " + dir + " NULLS LAST"
-	case len(t.PrimaryKey()) > 0:
-		order = " ORDER BY " + quoteAll(t.PrimaryKey())
-	}
-	return Statement{
-		SQL: "SELECT coalesce(json_agg(_r), '[]'::json)::text FROM (SELECT * FROM " + t.QualifiedName() +
-			order + " LIMIT $1 OFFSET $2) _r",
-		Args: []any{limit, offset},
-	}, nil
-}
-
 // BuildInsert inserts one row from a JSON object and returns it.
 // Columns absent from values get their defaults.
 func BuildInsert(t *Table, columns []string, valuesJSON string) (Statement, error) {

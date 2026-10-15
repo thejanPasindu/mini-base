@@ -2,6 +2,8 @@ package admin
 
 import (
 	"context"
+	"log/slog"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -22,23 +24,29 @@ func NewCLI(db *pgxpool.Pool) (*CLI, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &CLI{accounts: a}, nil
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	return &CLI{accounts: a.WithAudit(service.NewAudit(adminpg.NewAuditLog(db), log))}, nil
 }
+
+// Changes made from the command line appear in the audit log as "cli".
+func cli(ctx context.Context) context.Context { return service.WithActor(ctx, domain.CLIActor) }
 
 // Create adds an admin.
 func (c *CLI) Create(ctx context.Context, email, pw string) (domain.Account, error) {
-	return c.accounts.Create(ctx, email, pw)
+	return c.accounts.Create(cli(ctx), email, pw)
 }
 
 // List returns all admins.
 func (c *CLI) List(ctx context.Context) ([]domain.Account, error) { return c.accounts.List(ctx) }
 
 // Delete removes an admin.
-func (c *CLI) Delete(ctx context.Context, email string) error { return c.accounts.Delete(ctx, email) }
+func (c *CLI) Delete(ctx context.Context, email string) error {
+	return c.accounts.Delete(cli(ctx), email)
+}
 
 // ResetPassword sets a new password and ends the admin's sessions.
 func (c *CLI) ResetPassword(ctx context.Context, email, pw string) error {
-	return c.accounts.ResetPassword(ctx, email, pw)
+	return c.accounts.ResetPassword(cli(ctx), email, pw)
 }
 
 // GeneratePassword returns a random password suitable for an admin.

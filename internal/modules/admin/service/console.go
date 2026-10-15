@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/mini-base/mini-base/internal/modules/admin/domain"
 	"github.com/mini-base/mini-base/internal/modules/admin/port"
@@ -15,13 +16,31 @@ import (
 
 // Console implements the dashboard's data features.
 type Console struct {
-	catalog port.Catalog
-	data    port.DataStore
-	sql     port.SQLRunner
-	events  port.EventPublisher
-	users   func() ports.UserDirectory // nil result when the auth module is off
-	info    Info
-	maxRows int
+	catalog  port.Catalog
+	data     port.DataStore
+	sql      port.SQLRunner
+	events   port.EventPublisher
+	snippets port.SnippetStore
+	audit    *Audit
+	users    func() ports.UserDirectory // nil result when the auth module is off
+	settings func() []Setting
+	info     Info
+	maxRows  int
+}
+
+// ConsoleDeps are the Console's collaborators. Users and Settings are
+// called per request because other modules finish initialising later.
+type ConsoleDeps struct {
+	Catalog    port.Catalog
+	Data       port.DataStore
+	SQL        port.SQLRunner
+	Events     port.EventPublisher
+	Snippets   port.SnippetStore
+	Audit      *Audit                     // nil: nothing is recorded
+	Users      func() ports.UserDirectory // nil or nil result: auth module off
+	Settings   func() []Setting           // nil: no settings shown
+	Info       Info
+	MaxSQLRows int
 }
 
 // Info describes the running server for the overview page.
@@ -31,12 +50,19 @@ type Info struct {
 	Modules []string `json:"modules"`
 }
 
-// NewConsole returns a Console. users is looked up per call because the auth
-// module may provide the directory after this module initialises.
-func NewConsole(catalog port.Catalog, data port.DataStore, sql port.SQLRunner, events port.EventPublisher,
-	users func() ports.UserDirectory, info Info, maxSQLRows int,
-) *Console {
-	return &Console{catalog: catalog, data: data, sql: sql, events: events, users: users, info: info, maxRows: maxSQLRows}
+// NewConsole returns a Console.
+func NewConsole(d ConsoleDeps) *Console {
+	c := &Console{
+		catalog: d.Catalog, data: d.Data, sql: d.SQL, events: d.Events, snippets: d.Snippets, audit: d.Audit,
+		users: d.Users, settings: d.Settings, info: d.Info, maxRows: d.MaxSQLRows,
+	}
+	if c.users == nil {
+		c.users = func() ports.UserDirectory { return nil }
+	}
+	if c.settings == nil {
+		c.settings = func() []Setting { return nil }
+	}
+	return c
 }
 
 // ErrUsersUnavailable is returned by user features when auth is disabled.
@@ -107,30 +133,48 @@ func (c *Console) SetRLS(ctx context.Context, schema, name string, enabled bool)
 		return nil, fmt.Errorf("set rls: %w", err)
 	}
 	c.events.Publish(ctx, ports.EventSchemaChanged, map[string]string{"table": schema + "." + name})
+	action := domain.ActionRLSDisable
+	if enabled {
+		action = domain.ActionRLSEnable
+	}
+	c.audit.Record(ctx, action, schema+"."+name, nil)
 	return c.Table(ctx, schema, name)
 }
 
 // Page is a page of rows.
 type Page struct {
 	Rows       json.RawMessage `json:"rows"`
-	Total      int64           `json:"total"`
+	Total      int64           `json:"total"` // -1 when counting took too long
 	TotalExact bool            `json:"total_exact"`
 	Editable   bool            `json:"editable"`
 }
 
+// RowQuery selects rows in the browser.
+type RowQuery struct {
+	Filters []domain.Filter
+	Sort    *domain.SortTerm
+	Limit   int
+	Offset  int
+}
+
+// exactCountLimit: tables estimated above this are not fully counted
+// unless filtered, and filtered counts give up after countTimeout.
+const (
+	exactCountLimit = 100_000
+	countTimeout    = 3 * time.Second
+)
+
 // Browse returns rows of a table.
-func (c *Console) Browse(ctx context.Context, schema, name string, sort *domain.SortTerm, limit, offset int) (Page, error) {
+func (c *Console) Browse(ctx context.Context, schema, name string, q RowQuery) (Page, error) {
 	t, err := c.Table(ctx, schema, name)
 	if err != nil {
 		return Page{}, err
 	}
-	if limit < 1 || limit > 500 {
-		limit = 50
+	if q.Limit < 1 || q.Limit > 500 {
+		q.Limit = 50
 	}
-	if offset < 0 {
-		offset = 0
-	}
-	st, err := domain.BuildBrowse(t, sort, limit, offset)
+	q.Offset = max(q.Offset, 0)
+	st, err := domain.BuildBrowse(t, q.Filters, q.Sort, q.Limit, q.Offset)
 	if err != nil {
 		return Page{}, err
 	}
@@ -138,11 +182,37 @@ func (c *Console) Browse(ctx context.Context, schema, name string, sort *domain.
 	if err != nil {
 		return Page{}, err
 	}
-	total, exact, err := c.data.CountRows(ctx, t)
-	if err != nil {
-		return Page{}, err
+	page := Page{Rows: json.RawMessage(rows), Editable: t.Editable()}
+	page.Total, page.TotalExact, err = c.count(ctx, t, q.Filters)
+	return page, err
+}
+
+func (c *Console) count(ctx context.Context, t *domain.Table, filters []domain.Filter) (int64, bool, error) {
+	if t.EstimatedRows <= exactCountLimit {
+		st, err := domain.BuildCount(t, filters)
+		if err != nil {
+			return 0, false, err
+		}
+		n, err := c.data.Count(ctx, st)
+		return n, err == nil, err
 	}
-	return Page{Rows: json.RawMessage(rows), Total: total, TotalExact: exact, Editable: t.Editable()}, nil
+	if len(filters) == 0 {
+		return t.EstimatedRows, false, nil
+	}
+	st, err := domain.BuildCount(t, filters)
+	if err != nil {
+		return 0, false, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, countTimeout)
+	defer cancel()
+	n, err := c.data.Count(cctx, st)
+	if err != nil {
+		if ctx.Err() == nil && cctx.Err() != nil {
+			return -1, false, nil // too slow to count; the page itself is fine
+		}
+		return 0, false, err
+	}
+	return n, true, nil
 }
 
 // InsertRow inserts a row from a JSON object of column values.
@@ -159,7 +229,11 @@ func (c *Console) InsertRow(ctx context.Context, schema, name string, values map
 	if err != nil {
 		return nil, err
 	}
-	return c.one(ctx, st)
+	row, err := c.one(ctx, st)
+	if err == nil {
+		c.audit.Record(ctx, domain.ActionRowInsert, schema+"."+name, map[string]any{"columns": cols})
+	}
+	return row, err
 }
 
 // UpdateRow changes columns of the row identified by key.
@@ -180,7 +254,11 @@ func (c *Console) UpdateRow(ctx context.Context, schema, name string, key, value
 	if err != nil {
 		return nil, err
 	}
-	return c.one(ctx, st)
+	row, err := c.one(ctx, st)
+	if err == nil {
+		c.audit.Record(ctx, domain.ActionRowUpdate, schema+"."+name, map[string]any{"key": key, "columns": cols})
+	}
+	return row, err
 }
 
 // DeleteRow deletes the row identified by key.
@@ -197,7 +275,11 @@ func (c *Console) DeleteRow(ctx context.Context, schema, name string, key map[st
 	if err != nil {
 		return nil, err
 	}
-	return c.one(ctx, st)
+	row, err := c.one(ctx, st)
+	if err == nil {
+		c.audit.Record(ctx, domain.ActionRowDelete, schema+"."+name, map[string]any{"key": key})
+	}
+	return row, err
 }
 
 func (c *Console) one(ctx context.Context, st domain.Statement) (json.RawMessage, error) {
@@ -217,6 +299,14 @@ func (c *Console) RunSQL(ctx context.Context, query string) (domain.SQLRun, erro
 		return domain.SQLRun{}, errs.Invalid("admin.empty_query", "Enter some SQL to run")
 	}
 	run, err := c.sql.Run(ctx, query, c.maxRows)
+	detail := map[string]any{"query": domain.TruncateSQL(query), "ok": err == nil && run.Error == nil, "duration_ms": run.DurationMS}
+	switch {
+	case err != nil:
+		detail["error"] = err.Error()
+	case run.Error != nil:
+		detail["error"] = run.Error.Message
+	}
+	c.audit.Record(ctx, domain.ActionSQLRun, "", detail)
 	if err != nil {
 		return domain.SQLRun{}, err
 	}
@@ -232,6 +322,58 @@ func (c *Console) Users() (ports.UserDirectory, error) {
 		return dir, nil
 	}
 	return nil, ErrUsersUnavailable
+}
+
+// ListUsers pages through app users.
+func (c *Console) ListUsers(ctx context.Context, q ports.UserQuery) ([]ports.UserSummary, int, error) {
+	dir, err := c.Users()
+	if err != nil {
+		return nil, 0, err
+	}
+	users, total, err := dir.ListUsers(ctx, q)
+	if users == nil {
+		users = []ports.UserSummary{}
+	}
+	return users, total, err
+}
+
+// CreateUser adds an app user.
+func (c *Console) CreateUser(ctx context.Context, email, password string) (ports.UserSummary, error) {
+	dir, err := c.Users()
+	if err != nil {
+		return ports.UserSummary{}, err
+	}
+	u, err := dir.CreateUser(ctx, email, password)
+	if err == nil {
+		c.audit.Record(ctx, domain.ActionUserCreate, u.Email, map[string]any{"user_id": u.ID})
+	}
+	return u, err
+}
+
+// DeleteUser deletes an app user and everything that cascades from it.
+func (c *Console) DeleteUser(ctx context.Context, id string) error {
+	dir, err := c.Users()
+	if err != nil {
+		return err
+	}
+	if err := dir.DeleteUser(ctx, id); err != nil {
+		return err
+	}
+	c.audit.Record(ctx, domain.ActionUserDelete, id, map[string]any{"user_id": id})
+	return nil
+}
+
+// SignOutUser revokes an app user's sessions.
+func (c *Console) SignOutUser(ctx context.Context, id string) (int, error) {
+	dir, err := c.Users()
+	if err != nil {
+		return 0, err
+	}
+	n, err := dir.RevokeSessions(ctx, id)
+	if err == nil {
+		c.audit.Record(ctx, domain.ActionUserSignOut, id, map[string]any{"user_id": id, "sessions": n})
+	}
+	return n, err
 }
 
 // encode returns the keys (sorted) and the JSON object for values.

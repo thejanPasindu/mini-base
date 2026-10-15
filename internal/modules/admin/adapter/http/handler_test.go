@@ -22,7 +22,21 @@ import (
 
 const goodToken = "session-token"
 
-type fakeAccounts struct{ signedOut string }
+// The fakes embed the interfaces so tests only implement what they use;
+// calling anything else panics.
+type fakeAccounts struct {
+	adminhttp.Accounts
+	signedOut string
+	deletedBy domain.Actor
+}
+
+func (f *fakeAccounts) DeleteAccount(ctx context.Context, id string) error {
+	f.deletedBy, _ = service.ActorFrom(ctx)
+	if id == "a1" {
+		return domain.ErrCannotDeleteSelf
+	}
+	return nil
+}
 
 func (f *fakeAccounts) SignIn(_ context.Context, email, pw string, _ domain.ClientInfo) (service.Session, error) {
 	if pw != "correct password" {
@@ -45,7 +59,14 @@ func (f *fakeAccounts) SignOut(_ context.Context, token string) error {
 
 func (f *fakeAccounts) ChangePassword(context.Context, string, string, string) error { return nil }
 
-type fakeConsole struct{ sqlRuns int }
+type fakeConsole struct {
+	adminhttp.Console
+	sqlRuns     int
+	query       service.RowQuery
+	preview     bool
+	emptyAsNull bool
+	imported    string
+}
 
 func (f *fakeConsole) Overview(context.Context) (service.Overview, error) {
 	return service.Overview{Server: service.Info{Version: "test"}}, nil
@@ -57,8 +78,29 @@ func (f *fakeConsole) Table(context.Context, string, string) (*domain.Table, err
 func (f *fakeConsole) SetRLS(context.Context, string, string, bool) (*domain.Table, error) {
 	return nil, domain.ErrTableNotFound
 }
-func (f *fakeConsole) Browse(context.Context, string, string, *domain.SortTerm, int, int) (service.Page, error) {
+func (f *fakeConsole) Browse(_ context.Context, _, _ string, q service.RowQuery) (service.Page, error) {
+	f.query = q
 	return service.Page{Rows: json.RawMessage(`[]`)}, nil
+}
+func (f *fakeConsole) Export(_ context.Context, _, name string, q service.RowQuery, open func(string) io.Writer) (int64, error) {
+	if name != "todos" {
+		return 0, domain.ErrTableNotFound
+	}
+	f.query = q
+	_, _ = io.WriteString(open(name+".csv"), "id,title\n1,milk\n")
+	return 1, nil
+}
+func (f *fakeConsole) Import(_ context.Context, _, _ string, r io.Reader, emptyAsNull bool) (service.ImportResult, error) {
+	b, err := io.ReadAll(r)
+	f.imported, f.emptyAsNull = string(b), emptyAsNull
+	return service.ImportResult{Rows: 1}, err
+}
+func (f *fakeConsole) DropTable(_ context.Context, _, _, confirm string, preview bool) (service.DDLResult, error) {
+	f.preview = preview
+	return service.DDLResult{SQL: []string{"DROP TABLE x"}, Preview: preview}, nil
+}
+func (f *fakeConsole) ListUsers(context.Context, ports.UserQuery) ([]ports.UserSummary, int, error) {
+	return nil, 0, service.ErrUsersUnavailable
 }
 func (f *fakeConsole) InsertRow(context.Context, string, string, map[string]json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(`{}`), nil
@@ -73,7 +115,6 @@ func (f *fakeConsole) RunSQL(context.Context, string) (domain.SQLRun, error) {
 	f.sqlRuns++
 	return domain.SQLRun{}, nil
 }
-func (f *fakeConsole) Users() (ports.UserDirectory, error) { return nil, service.ErrUsersUnavailable }
 
 func newServer(t *testing.T) (http.Handler, *fakeAccounts, *fakeConsole) {
 	t.Helper()
@@ -205,5 +246,67 @@ func TestUsersPageWithoutAuthModule(t *testing.T) {
 	rec := do(h, req{method: "GET", path: "/_/api/users", cookie: true})
 	if rec.Code != 404 || !strings.Contains(rec.Body.String(), "admin.users_unavailable") {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestBrowseParsesFilters(t *testing.T) {
+	t.Parallel()
+	h, _, c := newServer(t)
+	rec := do(h, req{method: "GET", path: "/_/api/tables/public/todos/rows?filter=title:contains:a:b&filter=done:eq:true&sort=title&dir=desc&limit=5", cookie: true})
+	if rec.Code != 200 || len(c.query.Filters) != 2 || c.query.Filters[0].Value != "a:b" || !c.query.Sort.Desc || c.query.Limit != 5 {
+		t.Fatalf("got %d %+v", rec.Code, c.query)
+	}
+	if rec := do(h, req{method: "GET", path: "/_/api/tables/public/todos/rows?filter=nocolon", cookie: true}); rec.Code != 400 {
+		t.Fatalf("bad filter = %d", rec.Code)
+	}
+}
+
+func TestExportDownloadsCSV(t *testing.T) {
+	t.Parallel()
+	h, _, _ := newServer(t)
+	rec := do(h, req{method: "GET", path: "/_/api/tables/public/todos/export", cookie: true})
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "text/csv; charset=utf-8" ||
+		rec.Header().Get("Content-Disposition") != `attachment; filename=todos.csv` || rec.Body.String() != "id,title\n1,milk\n" {
+		t.Fatalf("got %d %v %q", rec.Code, rec.Header(), rec.Body)
+	}
+	// Errors found before streaming are normal JSON errors.
+	rec = do(h, req{method: "GET", path: "/_/api/tables/public/missing/export", cookie: true})
+	if rec.Code != 404 || !strings.Contains(rec.Body.String(), "admin.table_not_found") {
+		t.Fatalf("missing = %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestImportReadsRawCSV(t *testing.T) {
+	t.Parallel()
+	h, _, c := newServer(t)
+	rec := do(h, req{method: "POST", path: "/_/api/tables/public/todos/import?empty=string", body: "title\nmilk\n", cookie: true,
+		headers: map[string]string{adminhttp.CSRFHeader: "1", "Content-Type": "text/csv"}})
+	if rec.Code != 200 || c.imported != "title\nmilk\n" || c.emptyAsNull {
+		t.Fatalf("got %d %s imported %q", rec.Code, rec.Body, c.imported)
+	}
+	if rec := do(h, req{method: "POST", path: "/_/api/tables/public/todos/import", body: "title\n", cookie: true}); rec.Code != 403 {
+		t.Fatalf("import without CSRF header = %d", rec.Code)
+	}
+}
+
+func TestDesignerPreviewFlag(t *testing.T) {
+	t.Parallel()
+	h, _, c := newServer(t)
+	rec := do(h, req{method: "DELETE", path: "/_/api/tables/public/todos?preview=1", body: `{"confirm":"todos"}`, cookie: true, headers: csrf})
+	if rec.Code != 200 || !c.preview || !strings.Contains(rec.Body.String(), `"preview":true`) {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestActionsCarryTheSignedInAdmin(t *testing.T) {
+	t.Parallel()
+	h, a, _ := newServer(t)
+	rec := do(h, req{method: "DELETE", path: "/_/api/admins/a2", cookie: true, headers: csrf})
+	if rec.Code != 204 || a.deletedBy.Email != "ops@example.com" || a.deletedBy.AccountID != "a1" || a.deletedBy.IP == "" {
+		t.Fatalf("got %d actor %+v", rec.Code, a.deletedBy)
+	}
+	rec = do(h, req{method: "DELETE", path: "/_/api/admins/a1", cookie: true, headers: csrf})
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "admin.cannot_delete_self") {
+		t.Fatalf("delete self = %d %s", rec.Code, rec.Body)
 	}
 }

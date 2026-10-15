@@ -94,7 +94,7 @@ func TestModuleConfigIsScopedAndCollectsErrors(t *testing.T) {
 		"MINIBASE_STORAGE_DRIVER":   "s3",
 		"MINIBASE_STORAGE_MAX_SIZE": "big",
 		"MINIBASE_DRIVER":           "ignored",
-	}))
+	}), nil)
 	if got := c.String("DRIVER", "local"); got != "s3" {
 		t.Fatalf("driver = %q", got)
 	}
@@ -132,5 +132,52 @@ func TestLoadConfigValidatesKeys(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestSettingsRecordsReadsAndMasksSecrets(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := kernel.LoadConfig(envFrom(map[string]string{
+		"MINIBASE_DATABASE_URL": "postgres://app:hunter2@db:5432/app",
+		"MINIBASE_ANON_KEY":     strings.Repeat("a", 32),
+		"MINIBASE_SERVICE_KEY":  "svc-" + strings.Repeat("b", 28) + "wxyz",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := kernel.NewModuleConfig("auth", envFrom(map[string]string{"MINIBASE_AUTH_JWT_SECRET": "top-secret"}), cfg.Settings)
+	_ = m.String("JWT_SECRET", "")
+	_ = m.Duration("ACCESS_TOKEN_TTL", 15*time.Minute)
+
+	got := map[string]kernel.Setting{}
+	for _, s := range cfg.Settings.List() {
+		got[s.Name] = s
+	}
+	cases := []struct {
+		name, value string
+		set, secret bool
+	}{
+		{"MINIBASE_ANON_KEY", strings.Repeat("a", 32), true, false},
+		{"MINIBASE_SERVICE_KEY", "svc-…wxyz", true, true},
+		{"MINIBASE_DATABASE_URL", "postgres://app:xxxxx@db:5432/app", true, true},
+		{"MINIBASE_AUTH_JWT_SECRET", "", true, true},
+		{"MINIBASE_AUTH_ACCESS_TOKEN_TTL", "15m0s", false, false},
+		{"MINIBASE_HTTP_ADDR", ":8090", false, false},
+	}
+	for _, c := range cases {
+		s, ok := got[c.name]
+		if !ok {
+			t.Fatalf("%s not recorded", c.name)
+		}
+		if s.Value != c.value || s.IsSet != c.set || s.Secret != c.secret {
+			t.Errorf("%s = %+v, want value %q set %v secret %v", c.name, s, c.value, c.set, c.secret)
+		}
+	}
+	if v, ok := cfg.Settings.Raw("MINIBASE_ANON_KEY"); !ok || v != strings.Repeat("a", 32) {
+		t.Errorf("Raw(anon) = %q, %v", v, ok)
+	}
+	if _, ok := cfg.Settings.Raw("MINIBASE_SERVICE_KEY"); ok {
+		t.Error("Raw must not reveal secrets")
 	}
 }

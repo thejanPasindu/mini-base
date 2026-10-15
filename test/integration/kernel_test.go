@@ -429,3 +429,141 @@ func TestAdminDashboard(t *testing.T) {
 	st, b = call(http.MethodGet, "/me", "")
 	expect(t, "after logout", st, b, http.StatusUnauthorized)
 }
+
+// TestAdminTools covers the table designer, policy templates, CSV import and
+// export, snippets, history, settings, the audit log and admin management,
+// and checks that a designed table works through the REST API.
+func TestAdminTools(t *testing.T) {
+	base := startKernel(t, "admin,auth,database")
+	jar, _ := cookiejar.New(nil)
+	hc := &http.Client{Jar: jar}
+	call := func(method, path, body string, contentType ...string) (int, []byte) {
+		t.Helper()
+		req, _ := http.NewRequest(method, base+"/_/api"+path, strings.NewReader(body))
+		req.Header.Set("X-Minibase-Admin", "1")
+		switch {
+		case len(contentType) > 0:
+			req.Header.Set("Content-Type", contentType[0])
+		case body != "":
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := hc.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, b
+	}
+	st, b := call(http.MethodPost, "/login", `{"email":"itest-admin@example.com","password":"itest admin password"}`)
+	expect(t, "admin sign-in", st, b, http.StatusOK)
+	me := decode[struct {
+		Account struct{ ID string } `json:"account"`
+	}](t, b).Account.ID
+
+	// Settings: anon key in full, service key masked, secrets hidden.
+	st, b = call(http.MethodGet, "/settings", "")
+	expect(t, "settings", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte(`"anon_key":"`+anonKey+`"`)) || bytes.Contains(b, []byte(serviceKey)) || bytes.Contains(b, []byte(jwtSecret)) {
+		t.Fatalf("settings leak or miss keys: %s", b)
+	}
+
+	// Designer: preview runs nothing; create builds an RLS-protected table.
+	name := "itest_designed_" + strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "_")
+	spec := `{"schema":"public","name":"` + name + `","primary_key":"bigint","timestamps":true,"enable_rls":true,"columns":[
+		{"name":"title","type":"text","nullable":false},
+		{"name":"user_id","type":"uuid","nullable":false,"default":{"expression":"auth.uid()"},
+		 "references":{"schema":"auth","table":"users","column":"id","on_delete":"cascade"}}]}`
+	st, b = call(http.MethodPost, "/tables?preview=1", spec)
+	expect(t, "designer preview", st, b, http.StatusOK)
+	st, b = call(http.MethodGet, "/tables/public/"+name, "")
+	expect(t, "preview created nothing", st, b, http.StatusNotFound)
+	st, b = call(http.MethodPost, "/tables", spec)
+	expect(t, "create table", st, b, http.StatusCreated)
+	if !bytes.Contains(b, []byte(`"rls_enabled":true`)) {
+		t.Fatalf("created = %s", b)
+	}
+	path := "/tables/public/" + name
+	st, b = call(http.MethodPost, path+"/columns", `{"name":"score","type":"integer","nullable":true}`)
+	expect(t, "add column", st, b, http.StatusOK)
+	st, b = call(http.MethodPost, path+"/policies", `{"template":"owner_all","column":"user_id"}`)
+	expect(t, "owner policy", st, b, http.StatusOK)
+
+	// The designed table works end to end through the REST API.
+	anon := client{t: t, base: base, key: anonKey}
+	st, b = anon.do(http.MethodPost, "/auth/v1/signup", `{"email":"`+name+`@example.com","password":"correct horse battery"}`)
+	expect(t, "sign up", st, b, http.StatusCreated)
+	sess := decode[session](t, b)
+	user := anon
+	user.token = sess.AccessToken
+	st, b = user.do(http.MethodPost, "/rest/v1/"+name, `{"title":"from the api","score":3}`, "Prefer", "return=representation")
+	expect(t, "insert through REST", st, b, http.StatusCreated)
+	st, b = anon.do(http.MethodGet, "/rest/v1/"+name, "")
+	expect(t, "anon read", st, b, http.StatusOK)
+	if string(bytes.TrimSpace(b)) != "[]" {
+		t.Fatalf("anon must see no rows under owner_all: %s", b)
+	}
+
+	// CSV import (all or nothing) and export, with a filter.
+	csv := "title,user_id,score\nimported one," + sess.User.ID + ",7\n"
+	st, b = call(http.MethodPost, path+"/import", csv, "text/csv")
+	expect(t, "import", st, b, http.StatusOK)
+	st, b = call(http.MethodPost, path+"/import", "title,score\nbad,not-a-number\n", "text/csv")
+	expect(t, "bad import", st, b, http.StatusBadRequest)
+	if !bytes.Contains(b, []byte("Nothing was imported")) {
+		t.Fatalf("bad import = %s", b)
+	}
+	st, b = call(http.MethodGet, path+"/rows?filter=score:gte:5", "")
+	expect(t, "filtered browse", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte(`"total":1`)) || !bytes.Contains(b, []byte("imported one")) {
+		t.Fatalf("filtered = %s", b)
+	}
+	st, b = call(http.MethodGet, path+"/export?sort=score", "")
+	expect(t, "export", st, b, http.StatusOK)
+	if lines := strings.Split(strings.TrimSpace(string(b)), "\n"); len(lines) != 3 || !strings.HasPrefix(lines[0], "id,title,user_id,created_at,score") {
+		t.Fatalf("export = %s", b)
+	}
+
+	// Snippets and history.
+	st, b = call(http.MethodPost, "/snippets", `{"name":"count","query":"select count(*) from `+name+`"}`)
+	expect(t, "save snippet", st, b, http.StatusCreated)
+	st, b = call(http.MethodPost, "/snippets", `{"name":"count","query":"select 2"}`)
+	expect(t, "duplicate snippet", st, b, http.StatusConflict)
+	st, b = call(http.MethodPost, "/sql", `{"query":"select 'history check'"}`)
+	expect(t, "run sql", st, b, http.StatusOK)
+	st, b = call(http.MethodGet, "/sql/history", "")
+	expect(t, "history", st, b, http.StatusOK)
+	if !bytes.Contains(b, []byte("history check")) {
+		t.Fatalf("history = %s", b)
+	}
+
+	// Admins: add one with a generated password, refuse self-delete, remove.
+	st, b = call(http.MethodPost, "/admins", `{"email":"`+name+`-admin@example.com"}`)
+	expect(t, "add admin", st, b, http.StatusCreated)
+	added := decode[struct {
+		Admin             struct{ ID string } `json:"admin"`
+		GeneratedPassword string              `json:"generated_password"`
+	}](t, b)
+	if len(added.GeneratedPassword) < 20 {
+		t.Fatalf("generated password = %q", added.GeneratedPassword)
+	}
+	st, b = call(http.MethodDelete, "/admins/"+me, "")
+	expect(t, "delete self", st, b, http.StatusBadRequest)
+	st, b = call(http.MethodDelete, "/admins/"+added.Admin.ID, "")
+	expect(t, "delete other admin", st, b, http.StatusNoContent)
+
+	// Audit log has it all, attributed to this admin.
+	st, b = call(http.MethodGet, "/audit?actor=itest-admin@example.com&limit=200", "")
+	expect(t, "audit log", st, b, http.StatusOK)
+	for _, action := range []string{"schema.table_create", "schema.column_add", "schema.policy_create", "data.import", "data.export", "sql.run", "admin.create", "admin.delete"} {
+		if !bytes.Contains(b, []byte(`"action":"`+action+`"`)) {
+			t.Errorf("audit log lacks %s", action)
+		}
+	}
+
+	// Drop needs the name typed back.
+	st, b = call(http.MethodDelete, path, `{"confirm":"nope"}`)
+	expect(t, "drop without confirmation", st, b, http.StatusBadRequest)
+	st, b = call(http.MethodDelete, path, `{"confirm":"`+name+`"}`)
+	expect(t, "drop table", st, b, http.StatusOK)
+}

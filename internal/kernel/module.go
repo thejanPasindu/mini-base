@@ -76,6 +76,10 @@ type Deps struct {
 
 	// Info describes the running server (for status pages).
 	Info RuntimeInfo
+
+	// Settings lists the configuration in effect, secrets masked (for
+	// status pages). It fills in as modules read their settings.
+	Settings *Settings
 }
 
 // RuntimeInfo describes the running server.

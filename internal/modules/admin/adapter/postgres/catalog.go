@@ -130,6 +130,47 @@ func (c *Catalog) SetRLS(ctx context.Context, t *domain.Table, enabled bool) err
 	return mapError(err)
 }
 
+// Schemas implements port.Catalog.
+func (c *Catalog) Schemas(ctx context.Context, hidden []string) ([]string, error) {
+	rows, err := c.db.Query(ctx, `
+		SELECT nspname FROM pg_catalog.pg_namespace
+		WHERE nspname <> ALL($1::text[]) AND nspname NOT LIKE 'pg\_%'
+		ORDER BY nspname = 'public' DESC, nspname`, hidden)
+	if err != nil {
+		return nil, fmt.Errorf("list schemas: %w", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, fmt.Errorf("scan schema: %w", err)
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// ExecDDL implements port.Catalog. The statements come from the domain's
+// builders, which quote every identifier and literal; lock_timeout keeps a
+// busy table from stalling the request.
+func (c *Catalog) ExecDDL(ctx context.Context, statements []string) error {
+	tx, err := c.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SET LOCAL standard_conforming_strings = on; SET LOCAL lock_timeout = '5s'"); err != nil {
+		return fmt.Errorf("prepare ddl: %w", err)
+	}
+	for _, st := range statements {
+		if _, err := tx.Exec(ctx, st); err != nil {
+			return mapError(err)
+		}
+	}
+	return mapError(tx.Commit(ctx))
+}
+
 // Stats implements port.Catalog.
 func (c *Catalog) Stats(ctx context.Context) (port.DatabaseStats, error) {
 	var s port.DatabaseStats
@@ -154,20 +195,59 @@ func (c *Catalog) QueryText(ctx context.Context, st domain.Statement) (string, b
 	return *v, true, nil
 }
 
-// exactCountLimit: tables estimated above this get the planner's estimate
-// instead of a full count(*) scan.
-const exactCountLimit = 100_000
-
-// CountRows implements port.DataStore.
-func (c *Catalog) CountRows(ctx context.Context, t *domain.Table) (int64, bool, error) {
-	if t.EstimatedRows > exactCountLimit {
-		return t.EstimatedRows, false, nil
-	}
+// Count implements port.DataStore.
+func (c *Catalog) Count(ctx context.Context, st domain.Statement) (int64, error) {
 	var n int64
-	if err := c.db.QueryRow(ctx, "SELECT count(*) FROM "+t.QualifiedName()).Scan(&n); err != nil {
-		return 0, false, mapError(err)
+	if err := c.db.QueryRow(ctx, st.SQL, st.Args...).Scan(&n); err != nil {
+		return 0, mapError(err)
 	}
-	return n, true, nil
+	return n, nil
+}
+
+// Export implements port.DataStore. Rows are streamed, not buffered.
+func (c *Catalog) Export(ctx context.Context, st domain.Statement, emit func([]*string) error) (int64, error) {
+	rows, err := c.db.Query(ctx, st.SQL, st.Args...)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	defer rows.Close()
+	var n int64
+	for rows.Next() {
+		vals := make([]*string, len(rows.FieldDescriptions()))
+		ptrs := make([]any, len(vals))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return n, fmt.Errorf("scan export row: %w", err)
+		}
+		if err := emit(vals); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, mapError(rows.Err())
+}
+
+// Import implements port.DataStore.
+func (c *Catalog) Import(ctx context.Context, sql string, batches []string) (int64, int, error) {
+	tx, err := c.db.Begin(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var total int64
+	for i, b := range batches {
+		var n int64
+		if err := tx.QueryRow(ctx, sql, b).Scan(&n); err != nil {
+			return 0, i, mapError(err)
+		}
+		total += n
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, len(batches) - 1, mapError(err)
+	}
+	return total, 0, nil
 }
 
 func kindName(k string) string {
@@ -201,7 +281,8 @@ func mapError(err error) error {
 	case pgErr.Code == "23505" || pgErr.Code == "23503":
 		return errs.Conflict("admin.constraint_violation", msg).Wrap(err)
 	case strings.HasPrefix(pgErr.Code, "22"), strings.HasPrefix(pgErr.Code, "23"),
-		strings.HasPrefix(pgErr.Code, "42"), pgErr.Code == "P0001":
+		strings.HasPrefix(pgErr.Code, "42"), strings.HasPrefix(pgErr.Code, "2B"), strings.HasPrefix(pgErr.Code, "0A"),
+		pgErr.Code == "55P03", pgErr.Code == "P0001":
 		return errs.Invalid("admin.database_error", msg).Wrap(err)
 	}
 	return err

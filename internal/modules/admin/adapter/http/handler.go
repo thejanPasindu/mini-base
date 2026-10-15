@@ -4,6 +4,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -27,12 +28,18 @@ const CookieName = "minibase_admin"
 // grants for it, so a malicious site cannot forge dashboard requests.
 const CSRFHeader = "X-Minibase-Admin"
 
-// Accounts is what the handler needs for sign-in.
+// Accounts is what the handler needs for sign-in and managing admins.
 type Accounts interface {
 	SignIn(ctx context.Context, email, password string, c domain.ClientInfo) (service.Session, error)
 	Authenticate(ctx context.Context, token string) (domain.Account, error)
 	SignOut(ctx context.Context, token string) error
 	ChangePassword(ctx context.Context, accountID, current, next string) error
+
+	List(ctx context.Context) ([]domain.Account, error)
+	CreateAccount(ctx context.Context, email, password string) (domain.Account, string, error)
+	DeleteAccount(ctx context.Context, id string) error
+	ResetAccountPassword(ctx context.Context, id, password string) (string, error)
+	SignOutAccount(ctx context.Context, id string) error
 }
 
 // Console is what the handler needs for data features.
@@ -41,12 +48,33 @@ type Console interface {
 	Tables(ctx context.Context) ([]domain.TableSummary, error)
 	Table(ctx context.Context, schema, name string) (*domain.Table, error)
 	SetRLS(ctx context.Context, schema, name string, enabled bool) (*domain.Table, error)
-	Browse(ctx context.Context, schema, name string, sort *domain.SortTerm, limit, offset int) (service.Page, error)
+	Browse(ctx context.Context, schema, name string, q service.RowQuery) (service.Page, error)
 	InsertRow(ctx context.Context, schema, name string, values map[string]json.RawMessage) (json.RawMessage, error)
 	UpdateRow(ctx context.Context, schema, name string, key, values map[string]json.RawMessage) (json.RawMessage, error)
 	DeleteRow(ctx context.Context, schema, name string, key map[string]json.RawMessage) (json.RawMessage, error)
 	RunSQL(ctx context.Context, query string) (domain.SQLRun, error)
-	Users() (ports.UserDirectory, error)
+
+	ListUsers(ctx context.Context, q ports.UserQuery) ([]ports.UserSummary, int, error)
+	CreateUser(ctx context.Context, email, password string) (ports.UserSummary, error)
+	DeleteUser(ctx context.Context, id string) error
+	SignOutUser(ctx context.Context, id string) (int, error)
+
+	Schemas(ctx context.Context) ([]string, error)
+	CreateTable(ctx context.Context, spec domain.TableSpec, preview bool) (service.DDLResult, error)
+	DropTable(ctx context.Context, schema, name, confirm string, preview bool) (service.DDLResult, error)
+	AddColumn(ctx context.Context, schema, name string, col domain.ColumnSpec, preview bool) (service.DDLResult, error)
+	DropColumn(ctx context.Context, schema, name, column string, preview bool) (service.DDLResult, error)
+	AddPolicy(ctx context.Context, schema, name string, spec domain.PolicySpec, preview bool) (service.DDLResult, error)
+	DropPolicy(ctx context.Context, schema, name, policy string, preview bool) (service.DDLResult, error)
+
+	Export(ctx context.Context, schema, name string, q service.RowQuery, open func(filename string) io.Writer) (int64, error)
+	Import(ctx context.Context, schema, name string, r io.Reader, emptyAsNull bool) (service.ImportResult, error)
+	Snippets(ctx context.Context) ([]domain.Snippet, error)
+	SaveSnippet(ctx context.Context, id, name, query string) (domain.Snippet, error)
+	DeleteSnippet(ctx context.Context, id string) error
+	History(ctx context.Context, limit int) ([]domain.HistoryEntry, error)
+	AuditLog(ctx context.Context, q domain.AuditQuery) ([]domain.AuditEntry, error)
+	Settings() service.SettingsView
 }
 
 // Options configure the handler.
@@ -99,6 +127,33 @@ func (h *Handler) Routes(r *httpx.Router) {
 	s.HandleFunc(http.MethodPost, "/users", h.createUser)
 	s.HandleFunc(http.MethodPost, "/users/{id}/signout", h.signOutUser)
 	s.HandleFunc(http.MethodDelete, "/users/{id}", h.deleteUser)
+
+	// Table designer and policies.
+	s.HandleFunc(http.MethodGet, "/designer", h.designerMeta)
+	s.HandleFunc(http.MethodPost, "/tables", h.createTable)
+	s.HandleFunc(http.MethodDelete, "/tables/{schema}/{table}", h.dropTable)
+	s.HandleFunc(http.MethodPost, "/tables/{schema}/{table}/columns", h.addColumn)
+	s.HandleFunc(http.MethodDelete, "/tables/{schema}/{table}/columns/{column}", h.dropColumn)
+	s.HandleFunc(http.MethodPost, "/tables/{schema}/{table}/policies", h.addPolicy)
+	s.HandleFunc(http.MethodDelete, "/tables/{schema}/{table}/policies/{policy}", h.dropPolicy)
+
+	// Data tools.
+	s.HandleFunc(http.MethodGet, "/tables/{schema}/{table}/export", h.export)
+	s.HandleFunc(http.MethodPost, "/tables/{schema}/{table}/import", h.importCSV)
+	s.HandleFunc(http.MethodGet, "/snippets", h.listSnippets)
+	s.HandleFunc(http.MethodPost, "/snippets", h.saveSnippet)
+	s.HandleFunc(http.MethodPut, "/snippets/{id}", h.saveSnippet)
+	s.HandleFunc(http.MethodDelete, "/snippets/{id}", h.deleteSnippet)
+	s.HandleFunc(http.MethodGet, "/sql/history", h.sqlHistory)
+
+	// Settings, audit log and admins.
+	s.HandleFunc(http.MethodGet, "/settings", h.settings)
+	s.HandleFunc(http.MethodGet, "/audit", h.auditLog)
+	s.HandleFunc(http.MethodGet, "/admins", h.listAdmins)
+	s.HandleFunc(http.MethodPost, "/admins", h.createAdmin)
+	s.HandleFunc(http.MethodDelete, "/admins/{id}", h.deleteAdmin)
+	s.HandleFunc(http.MethodPost, "/admins/{id}/password", h.resetAdminPassword)
+	s.HandleFunc(http.MethodPost, "/admins/{id}/signout", h.signOutAdmin)
 }
 
 // ---- static UI ----
@@ -180,7 +235,9 @@ func (h *Handler) requireSession(next http.Handler) http.Handler {
 			httpx.WriteError(w, r, h.log, err)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), accountKey{}, acct)))
+		ctx := context.WithValue(r.Context(), accountKey{}, acct)
+		ctx = service.WithActor(ctx, domain.Actor{AccountID: acct.ID, Email: acct.Email, IP: ratelimit.ClientIP(r)})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -289,15 +346,32 @@ func tableResponse(t *domain.Table) any {
 	return map[string]any{"table": t, "editable": t.Editable(), "primary_key": t.PrimaryKey()}
 }
 
-func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
+// rowQuery reads filter=col:op:value (repeatable), sort, dir, limit, offset.
+func rowQuery(r *http.Request) (service.RowQuery, error) {
 	q := r.URL.Query()
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	var sort *domain.SortTerm
+	var rq service.RowQuery
+	rq.Limit, _ = strconv.Atoi(q.Get("limit"))
+	rq.Offset, _ = strconv.Atoi(q.Get("offset"))
 	if col := q.Get("sort"); col != "" {
-		sort = &domain.SortTerm{Column: col, Desc: q.Get("dir") == "desc"}
+		rq.Sort = &domain.SortTerm{Column: col, Desc: q.Get("dir") == "desc"}
 	}
-	page, err := h.console.Browse(r.Context(), r.PathValue("schema"), r.PathValue("table"), sort, limit, offset)
+	for _, raw := range q["filter"] {
+		f, err := domain.ParseFilter(raw)
+		if err != nil {
+			return rq, err
+		}
+		rq.Filters = append(rq.Filters, f)
+	}
+	return rq, nil
+}
+
+func (h *Handler) browse(w http.ResponseWriter, r *http.Request) {
+	rq, err := rowQuery(r)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	page, err := h.console.Browse(r.Context(), r.PathValue("schema"), r.PathValue("table"), rq)
 	h.respond(w, r, page, err)
 }
 
@@ -346,27 +420,14 @@ func (h *Handler) runSQL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
-	dir, err := h.console.Users()
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
-	users, total, err := dir.ListUsers(r.Context(), ports.UserQuery{Search: q.Get("search"), Limit: limit, Offset: offset})
-	if users == nil {
-		users = []ports.UserSummary{}
-	}
+	users, total, err := h.console.ListUsers(r.Context(), ports.UserQuery{Search: q.Get("search"), Limit: limit, Offset: offset})
 	h.respond(w, r, map[string]any{"users": users, "total": total}, err)
 }
 
 func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
-	dir, err := h.console.Users()
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
 	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -374,31 +435,17 @@ func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &req) {
 		return
 	}
-	u, err := dir.CreateUser(r.Context(), req.Email, req.Password)
+	u, err := h.console.CreateUser(r.Context(), req.Email, req.Password)
 	h.respondStatus(w, r, http.StatusCreated, map[string]any{"user": u}, err)
 }
 
 func (h *Handler) signOutUser(w http.ResponseWriter, r *http.Request) {
-	dir, err := h.console.Users()
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	n, err := dir.RevokeSessions(r.Context(), r.PathValue("id"))
+	n, err := h.console.SignOutUser(r.Context(), r.PathValue("id"))
 	h.respond(w, r, map[string]any{"revoked_sessions": n}, err)
 }
 
 func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
-	dir, err := h.console.Users()
-	if err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	if err := dir.DeleteUser(r.Context(), r.PathValue("id")); err != nil {
-		h.fail(w, r, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	h.noContent(w, r, h.console.DeleteUser(r.Context(), r.PathValue("id")))
 }
 
 // ---- helpers ----
@@ -421,6 +468,14 @@ func (h *Handler) respondStatus(w http.ResponseWriter, r *http.Request, status i
 		return
 	}
 	httpx.WriteJSON(w, status, v)
+}
+
+func (h *Handler) noContent(w http.ResponseWriter, r *http.Request, err error) {
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {

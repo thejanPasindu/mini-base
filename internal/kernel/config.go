@@ -33,6 +33,10 @@ type Config struct {
 	Log      LogConfig
 	Keys     KeysConfig
 	Modules  []string
+
+	// Settings records every variable read, kernel and modules alike, for
+	// the admin dashboard's settings page. Secret values are masked.
+	Settings *Settings
 }
 
 // KeysConfig holds the API keys checked on every module API request.
@@ -70,7 +74,8 @@ type LogConfig struct {
 // LoadConfig reads the kernel configuration using getenv (os.Getenv in
 // production, a map in tests). All problems are reported together.
 func LoadConfig(getenv func(string) string) (Config, error) {
-	e := envReader{getenv: getenv, prefix: EnvPrefix}
+	settings := NewSettings()
+	e := envReader{getenv: getenv, prefix: EnvPrefix, rec: settings}
 
 	env := Environment(e.str("ENV", string(EnvDevelopment)))
 	defaultCORS, defaultLogFormat := "*", "text"
@@ -103,7 +108,8 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			Anon:    e.str("ANON_KEY", ""),
 			Service: e.str("SERVICE_KEY", ""),
 		},
-		Modules: e.list("MODULES", ""),
+		Modules:  e.list("MODULES", ""),
+		Settings: settings,
 	}
 
 	if err := errors.Join(e.err(), cfg.Validate()); err != nil {
@@ -163,9 +169,10 @@ type ModuleConfig struct {
 	r envReader
 }
 
-// NewModuleConfig returns the config reader for module name.
-func NewModuleConfig(name string, getenv func(string) string) *ModuleConfig {
-	return &ModuleConfig{r: envReader{getenv: getenv, prefix: EnvPrefix + strings.ToUpper(name) + "_"}}
+// NewModuleConfig returns the config reader for module name. Values read
+// are recorded in rec when it is not nil.
+func NewModuleConfig(name string, getenv func(string) string, rec *Settings) *ModuleConfig {
+	return &ModuleConfig{r: envReader{getenv: getenv, prefix: EnvPrefix + strings.ToUpper(name) + "_", rec: rec}}
 }
 
 // String returns the value of key or def.
@@ -193,22 +200,26 @@ type envReader struct {
 	getenv func(string) string
 	prefix string
 	errs   []error
+	rec    *Settings
 }
 
-func (e *envReader) raw(key string) (string, bool) {
+// raw returns the trimmed value of key and records the read; def is the
+// default rendered as text.
+func (e *envReader) raw(key, def string) (string, bool) {
 	v := strings.TrimSpace(e.getenv(e.prefix + key))
+	e.rec.record(e.prefix+key, v, def)
 	return v, v != ""
 }
 
 func (e *envReader) str(key, def string) string {
-	if v, ok := e.raw(key); ok {
+	if v, ok := e.raw(key, def); ok {
 		return v
 	}
 	return def
 }
 
 func (e *envReader) int(key string, def int) int {
-	v, ok := e.raw(key)
+	v, ok := e.raw(key, strconv.Itoa(def))
 	if !ok {
 		return def
 	}
@@ -221,7 +232,7 @@ func (e *envReader) int(key string, def int) int {
 }
 
 func (e *envReader) bool(key string, def bool) bool {
-	v, ok := e.raw(key)
+	v, ok := e.raw(key, strconv.FormatBool(def))
 	if !ok {
 		return def
 	}
@@ -234,7 +245,7 @@ func (e *envReader) bool(key string, def bool) bool {
 }
 
 func (e *envReader) duration(key string, def time.Duration) time.Duration {
-	v, ok := e.raw(key)
+	v, ok := e.raw(key, def.String())
 	if !ok {
 		return def
 	}
@@ -247,7 +258,7 @@ func (e *envReader) duration(key string, def time.Duration) time.Duration {
 }
 
 func (e *envReader) level(key string, def slog.Level) slog.Level {
-	v, ok := e.raw(key)
+	v, ok := e.raw(key, strings.ToLower(def.String()))
 	if !ok {
 		return def
 	}

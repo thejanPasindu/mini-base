@@ -207,7 +207,7 @@ func (k *Kernel) initModules(ctx context.Context, mods []Module, pool *pgxpool.P
 	info := RuntimeInfo{Version: k.version, Env: k.cfg.Env, Modules: moduleNames(mods)}
 	for _, m := range mods {
 		deps := Deps{
-			Config:   NewModuleConfig(m.Name(), k.getenv),
+			Config:   NewModuleConfig(m.Name(), k.getenv, k.cfg.Settings),
 			DB:       pool,
 			Bus:      bus,
 			Logger:   k.log.With(slog.String("module", m.Name())),
@@ -215,6 +215,7 @@ func (k *Kernel) initModules(ctx context.Context, mods []Module, pool *pgxpool.P
 			Env:      k.cfg.Env,
 			Auth:     auth,
 			Info:     info,
+			Settings: k.cfg.Settings,
 		}
 		if err := m.Init(ctx, deps); err != nil {
 			return fmt.Errorf("init module %s: %w", m.Name(), err)

@@ -8,7 +8,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mini-base/mini-base/internal/modules/admin/domain"
 	"github.com/mini-base/mini-base/internal/modules/admin/port"
@@ -22,6 +24,7 @@ type Accounts struct {
 	sessionTTL time.Duration
 	now        func() time.Time
 	dummyHash  string
+	audit      *Audit
 }
 
 // NewAccounts returns an Accounts service.
@@ -36,6 +39,9 @@ func NewAccounts(accounts port.AccountStore, sessions port.SessionStore, hasher 
 // WithClock replaces the time source (tests).
 func (a *Accounts) WithClock(now func() time.Time) *Accounts { a.now = now; return a }
 
+// WithAudit records sign-ins and account changes in the audit log.
+func (a *Accounts) WithAudit(au *Audit) *Accounts { a.audit = au; return a }
+
 // Session is a signed-in dashboard session. Token goes into a cookie.
 type Session struct {
 	Token     string
@@ -45,15 +51,20 @@ type Session struct {
 
 // SignIn checks credentials and opens a session.
 func (a *Accounts) SignIn(ctx context.Context, email, password string, c domain.ClientInfo) (Session, error) {
+	failed := func() (Session, error) {
+		a.audit.RecordAs(ctx, domain.Actor{Email: truncate(strings.ToLower(strings.TrimSpace(email)), 254), IP: c.IP},
+			domain.ActionSignInFailed, "", nil)
+		return Session{}, domain.ErrInvalidCredentials
+	}
 	email, err := domain.NormalizeEmail(email)
 	if err != nil || len(password) > domain.MaxPasswordLength {
-		return Session{}, domain.ErrInvalidCredentials
+		return failed()
 	}
 	acct, hash, err := a.accounts.FindByEmail(ctx, email)
 	switch {
 	case errors.Is(err, domain.ErrAccountNotFound):
 		_, _ = a.hasher.Verify(ctx, password, a.dummyHash) // equal timing
-		return Session{}, domain.ErrInvalidCredentials
+		return failed()
 	case err != nil:
 		return Session{}, fmt.Errorf("find admin: %w", err)
 	}
@@ -62,7 +73,7 @@ func (a *Accounts) SignIn(ctx context.Context, email, password string, c domain.
 		return Session{}, fmt.Errorf("verify password: %w", err)
 	}
 	if !ok {
-		return Session{}, domain.ErrInvalidCredentials
+		return failed()
 	}
 
 	token, tokenHash, err := newToken()
@@ -78,6 +89,7 @@ func (a *Accounts) SignIn(ctx context.Context, email, password string, c domain.
 		return Session{}, fmt.Errorf("record sign-in: %w", err)
 	}
 	acct.LastSignInAt = &now
+	a.audit.RecordAs(ctx, domain.Actor{AccountID: acct.ID, Email: acct.Email, IP: c.IP}, domain.ActionSignIn, "", map[string]any{"user_agent": truncate(c.UserAgent, 200)})
 	return Session{Token: token, ExpiresAt: exp, Account: acct}, nil
 }
 
@@ -98,6 +110,7 @@ func (a *Accounts) SignOut(ctx context.Context, token string) error {
 	if err := a.sessions.Delete(ctx, hashToken(token)); err != nil {
 		return fmt.Errorf("delete session: %w", err)
 	}
+	a.audit.Record(ctx, domain.ActionSignOut, "", nil)
 	return nil
 }
 
@@ -118,7 +131,11 @@ func (a *Accounts) ChangePassword(ctx context.Context, accountID, current, next 
 	if !ok {
 		return ErrWrongPassword
 	}
-	return a.setPassword(ctx, accountID, next)
+	if err := a.setPassword(ctx, accountID, next); err != nil {
+		return err
+	}
+	a.audit.Record(ctx, domain.ActionPasswordChange, "", nil)
+	return nil
 }
 
 // Create adds an operator (CLI and first-run bootstrap).
@@ -138,6 +155,7 @@ func (a *Accounts) Create(ctx context.Context, email, password string) (domain.A
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("create admin: %w", err)
 	}
+	a.audit.Record(ctx, domain.ActionAdminCreate, acct.Email, nil)
 	return acct, nil
 }
 
@@ -152,7 +170,11 @@ func (a *Accounts) ResetPassword(ctx context.Context, email, password string) er
 	if err != nil {
 		return fmt.Errorf("find admin: %w", err)
 	}
-	return a.setPassword(ctx, acct.ID, password)
+	if err := a.setPassword(ctx, acct.ID, password); err != nil {
+		return err
+	}
+	a.audit.Record(ctx, domain.ActionAdminReset, acct.Email, nil)
+	return nil
 }
 
 func (a *Accounts) setPassword(ctx context.Context, accountID, password string) error {
@@ -181,7 +203,83 @@ func (a *Accounts) Delete(ctx context.Context, email string) error {
 	if err != nil {
 		return err
 	}
-	return a.accounts.Delete(ctx, email)
+	if err := a.accounts.Delete(ctx, email); err != nil {
+		return err
+	}
+	a.audit.Record(ctx, domain.ActionAdminDelete, email, nil)
+	return nil
+}
+
+// ---- managing other admins from the dashboard ----
+// The acting admin comes from ctx (WithActor).
+
+// CreateAccount adds an admin. With an empty password, one is generated and
+// returned so it can be passed on once.
+func (a *Accounts) CreateAccount(ctx context.Context, email, password string) (domain.Account, string, error) {
+	generated := ""
+	if password == "" {
+		p, err := GeneratePassword()
+		if err != nil {
+			return domain.Account{}, "", err
+		}
+		password, generated = p, p
+	}
+	acct, err := a.Create(ctx, email, password)
+	if err != nil {
+		return domain.Account{}, "", err
+	}
+	return acct, generated, nil
+}
+
+// DeleteAccount removes another admin. Admins cannot delete themselves, and
+// the last admin cannot be deleted.
+func (a *Accounts) DeleteAccount(ctx context.Context, id string) error {
+	if actor, _ := ActorFrom(ctx); actor.AccountID == id {
+		return domain.ErrCannotDeleteSelf
+	}
+	acct, err := a.accounts.DeleteByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	a.audit.Record(ctx, domain.ActionAdminDelete, acct.Email, nil)
+	return nil
+}
+
+// ResetAccountPassword sets another admin's password (generated when empty)
+// and signs them out everywhere. It returns the generated password.
+func (a *Accounts) ResetAccountPassword(ctx context.Context, id, password string) (string, error) {
+	if actor, _ := ActorFrom(ctx); actor.AccountID == id {
+		return "", domain.ErrUseChangePassword
+	}
+	acct, _, err := a.accounts.FindByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	generated := ""
+	if password == "" {
+		if password, err = GeneratePassword(); err != nil {
+			return "", err
+		}
+		generated = password
+	}
+	if err := a.setPassword(ctx, id, password); err != nil {
+		return "", err
+	}
+	a.audit.Record(ctx, domain.ActionAdminReset, acct.Email, nil)
+	return generated, nil
+}
+
+// SignOutAccount ends every session of an admin.
+func (a *Accounts) SignOutAccount(ctx context.Context, id string) error {
+	acct, _, err := a.accounts.FindByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := a.sessions.DeleteForAccount(ctx, id); err != nil {
+		return fmt.Errorf("end sessions: %w", err)
+	}
+	a.audit.Record(ctx, domain.ActionAdminSignOut, acct.Email, nil)
+	return nil
 }
 
 // Count returns how many operators exist.
@@ -208,6 +306,16 @@ func newToken() (string, []byte, error) {
 	}
 	t := base64.RawURLEncoding.EncodeToString(b[:])
 	return t, hashToken(t), nil
+}
+
+func truncate(s string, n int) string {
+	for len(s) > n {
+		s = s[:n]
+		for !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
 }
 
 func hashToken(t string) []byte {

@@ -1,5 +1,6 @@
-// Package admin serves the web dashboard at /_/: overview, table editor with
-// RLS policies, SQL editor, and app user management.
+// Package admin serves the web dashboard at /_/: overview, table editor and
+// designer with RLS policy templates, CSV import/export, SQL editor with
+// saved snippets, app users, API docs and keys, the audit log and admins.
 //
 // Dashboard operators are separate from application users. Create the first
 // one with `minibase admin create --email you@example.com`, or set
@@ -13,6 +14,7 @@
 //	MINIBASE_ADMIN_SQL_MAX_ROWS       default 500 (rows shown per result)
 //	MINIBASE_ADMIN_SECURE_COOKIE      default false; set true behind an HTTPS proxy
 //	MINIBASE_ADMIN_LOGIN_RATE_LIMIT   default 10 attempts per minute per IP
+//	MINIBASE_ADMIN_AUDIT_RETENTION    default 2160h (90 days); 0 keeps everything
 package admin
 
 import (
@@ -28,6 +30,7 @@ import (
 	"github.com/mini-base/mini-base/internal/kernel"
 	adminhttp "github.com/mini-base/mini-base/internal/modules/admin/adapter/http"
 	adminpg "github.com/mini-base/mini-base/internal/modules/admin/adapter/postgres"
+	"github.com/mini-base/mini-base/internal/modules/admin/domain"
 	"github.com/mini-base/mini-base/internal/modules/admin/service"
 	"github.com/mini-base/mini-base/internal/platform/httpx"
 	"github.com/mini-base/mini-base/internal/platform/password"
@@ -45,6 +48,8 @@ var web embed.FS
 type Module struct {
 	kernel.BaseModule
 	accounts *service.Accounts
+	audit    *service.Audit
+	retain   time.Duration
 	handler  *adminhttp.Handler
 	log      *slog.Logger
 	stop     chan struct{}
@@ -67,6 +72,7 @@ func (*Module) Migrations() fs.FS { return sub(migrations, "migrations") }
 type config struct {
 	bootstrapEmail, bootstrapPassword string
 	sessionTTL, sqlTimeout            time.Duration
+	auditRetention                    time.Duration
 	sqlMaxRows, loginRate             int
 	secureCookie                      bool
 }
@@ -80,6 +86,7 @@ func loadConfig(c *kernel.ModuleConfig) (config, error) {
 		sqlMaxRows:        c.Int("SQL_MAX_ROWS", 500),
 		loginRate:         c.Int("LOGIN_RATE_LIMIT", 10),
 		secureCookie:      c.Bool("SECURE_COOKIE", false),
+		auditRetention:    c.Duration("AUDIT_RETENTION", 90*24*time.Hour),
 	}
 	problems := []error{c.Err()}
 	if cfg.sessionTTL < 5*time.Minute || cfg.sessionTTL > 30*24*time.Hour {
@@ -87,6 +94,9 @@ func loadConfig(c *kernel.ModuleConfig) (config, error) {
 	}
 	if cfg.sqlMaxRows < 1 || cfg.sqlMaxRows > 10_000 {
 		problems = append(problems, errors.New("MINIBASE_ADMIN_SQL_MAX_ROWS must be between 1 and 10000"))
+	}
+	if cfg.auditRetention < 0 || (cfg.auditRetention > 0 && cfg.auditRetention < time.Hour) {
+		problems = append(problems, errors.New("MINIBASE_ADMIN_AUDIT_RETENTION must be 0 (keep everything) or at least 1h"))
 	}
 	if (cfg.bootstrapEmail == "") != (cfg.bootstrapPassword == "") {
 		problems = append(problems, errors.New("set both MINIBASE_ADMIN_EMAIL and MINIBASE_ADMIN_PASSWORD, or neither"))
@@ -101,13 +111,15 @@ func (m *Module) Init(ctx context.Context, deps kernel.Deps) error {
 		return err
 	}
 	m.log = deps.Logger
+	m.retain = cfg.auditRetention
+	m.audit = service.NewAudit(adminpg.NewAuditLog(deps.DB), deps.Logger)
 
 	accounts, err := newAccounts(deps, cfg.sessionTTL)
 	if err != nil {
 		return err
 	}
-	m.accounts = accounts
-	if err := m.bootstrap(ctx, cfg); err != nil {
+	m.accounts = accounts.WithAudit(m.audit)
+	if err := m.bootstrap(service.WithActor(ctx, domain.Actor{Email: "bootstrap"}), cfg); err != nil {
 		return err
 	}
 
@@ -119,12 +131,32 @@ func (m *Module) Init(ctx context.Context, deps kernel.Deps) error {
 		}
 		return d
 	}
-	console := service.NewConsole(catalog, catalog, adminpg.NewSQLRunner(deps.DB, cfg.sqlTimeout), deps.Bus, users,
-		service.Info{Version: deps.Info.Version, Env: string(deps.Info.Env), Modules: deps.Info.Modules}, cfg.sqlMaxRows)
+	console := service.NewConsole(service.ConsoleDeps{
+		Catalog:    catalog,
+		Data:       catalog,
+		SQL:        adminpg.NewSQLRunner(deps.DB, cfg.sqlTimeout),
+		Events:     deps.Bus,
+		Snippets:   adminpg.NewSnippets(deps.DB),
+		Audit:      m.audit,
+		Users:      users,
+		Settings:   func() []service.Setting { return settings(deps.Settings) },
+		Info:       service.Info{Version: deps.Info.Version, Env: string(deps.Info.Env), Modules: deps.Info.Modules},
+		MaxSQLRows: cfg.sqlMaxRows,
+	})
 
 	m.handler = adminhttp.NewHandler(accounts, console, sub(web, "web"), ratelimit.New(cfg.loginRate, 5), deps.Logger,
 		adminhttp.Options{SecureCookie: cfg.secureCookie})
 	return nil
+}
+
+// settings converts the kernel's record of configuration for the console.
+func settings(s *kernel.Settings) []service.Setting {
+	list := s.List()
+	out := make([]service.Setting, len(list))
+	for i, st := range list {
+		out[i] = service.Setting(st)
+	}
+	return out
 }
 
 func newAccounts(deps kernel.Deps, ttl time.Duration) (*service.Accounts, error) {
@@ -158,7 +190,8 @@ func (m *Module) bootstrap(ctx context.Context, cfg config) error {
 // Routes implements kernel.Module.
 func (m *Module) Routes(r *httpx.Router) { m.handler.Routes(r) }
 
-// Start implements kernel.Module: hourly cleanup of expired sessions.
+// Start implements kernel.Module: hourly cleanup of expired sessions and
+// old audit entries.
 func (m *Module) Start(ctx context.Context) error {
 	m.stop = make(chan struct{})
 	m.wg.Add(1)
@@ -175,6 +208,9 @@ func (m *Module) Start(ctx context.Context) error {
 			case <-t.C:
 				if _, err := m.accounts.PurgeExpired(ctx); err != nil {
 					m.log.WarnContext(ctx, "purge admin sessions", slog.Any("error", err))
+				}
+				if _, err := m.audit.Purge(ctx, m.retain); err != nil {
+					m.log.WarnContext(ctx, "purge audit log", slog.Any("error", err))
 				}
 			}
 		}

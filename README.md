@@ -24,7 +24,7 @@ Think Firebase / Supabase, but small enough for a $5 VPS or a Raspberry Pi, and 
 | `storage` | planned | File buckets on local disk or any S3-compatible store |
 | `realtime` | planned | WebSocket subscriptions to table changes, broadcast, presence |
 | `hooks` | planned | Signed webhooks on events, with retries |
-| `admin` | ✅ | Web dashboard at `/_/`: table editor, RLS policies, SQL editor, user management |
+| `admin` | ✅ | Web dashboard at `/_/`: table designer, RLS policy templates, CSV import/export, SQL editor with snippets, users, API docs and keys, audit log, admin management |
 
 ## Quick start (Docker)
 

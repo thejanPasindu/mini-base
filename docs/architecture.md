@@ -1,6 +1,6 @@
 # mini-base — Architecture Design
 
-> Status: **v0.4 — Phase 1 and the admin dashboard implemented** · Last updated: 2026-10-14
+> Status: **v0.5 — Phase 1 and the admin dashboard (with designer, data tools, API docs and audit log) implemented** · Last updated: 2026-10-15
 > Scope: system design for v1. Implementation details live in code and ADRs (`docs/adr/`).
 
 ---
@@ -229,7 +229,7 @@ Optional (dotted) dependency = the module works without it but gains features wh
 | `storage` | off | `/storage/v1` | `storage` | Buckets + files, local or S3 driver, signed URLs |
 | `realtime` | off | `/realtime/v1` (WS) | `realtime` | DB change streams, broadcast, presence |
 | `hooks` | off | `/hooks/v1` | `hooks` | Outbound webhooks on events, retries |
-| `admin` | off | `/_/` | `admin` | Web dashboard: tables, RLS, SQL editor, users (✅) |
+| `admin` | off | `/_/` | `admin` | Web dashboard: table designer, RLS policies, data tools, SQL editor, users, API docs, audit log, admins (✅) |
 | `example` | off | `/example/v1` | `example` | Reference module and template for contributors (Phase 0) |
 
 ---
@@ -378,7 +378,18 @@ One WebSocket endpoint, three channel types (mirrors the Supabase mental model):
 
 ### 5.7 `admin` — ✅ dashboard (built ahead of storage and realtime)
 
-Web dashboard at `/_/` with a JSON API at `/_/api`. Pages: **Overview** (server, database, tables without RLS), **Tables** (browse, sort, page; add, edit and delete rows by primary key; structure; turn RLS on or off; policies), **SQL editor**, **Users** (when `auth` is enabled).
+Web dashboard at `/_/` with a JSON API at `/_/api`. Pages:
+
+| Page | Contents |
+|---|---|
+| Overview | Server, database, tables without RLS |
+| Tables | Browse, filter, sort and page rows; add, edit and delete rows by primary key; CSV export and import; **table designer** (new tables, add and drop columns, drop tables); RLS on or off; **policy templates**; per-table **API docs** with curl and JavaScript examples |
+| SQL editor | Scripts, saved snippets (per admin), run history |
+| Users | App users (when `auth` is enabled) |
+| API and keys | URL, anon key, service key (masked), auth examples |
+| Audit log | Who did what, filterable by kind of action and admin |
+| Admins | Add (with a generated password), reset password, sign out everywhere, remove |
+| Settings | Every `MINIBASE_*` variable in effect, secrets hidden |
 
 - **Frontend without a build step.** Plain HTML, CSS and ES modules embedded in the binary with `embed.FS`. The only third-party code is the 13 KB Preact + htm bundle, vendored with its licence and checksum (`web/assets/vendor`). No Node.js is needed to build or contribute.
 - **Separate operator accounts** in the module's own `admin` schema (Argon2id, at least 12 characters), created with `minibase admin create` or bootstrapped from `MINIBASE_ADMIN_EMAIL` / `_PASSWORD` when none exist. They work with or without the `auth` module.
@@ -387,6 +398,12 @@ Web dashboard at `/_/` with a JSON API at `/_/api`. Pages: **Overview** (server,
 - **Strict CSP:** `script-src 'self'`, no inline script, `frame-ancestors 'none'`.
 - **SQL editor** runs as the connection user on a connection *removed from the pool and closed afterwards*, so `SET ROLE`, `search_path` changes or open transactions cannot leak into API traffic. Each script has a statement timeout (30 s), results are capped (500 rows per statement), and every run is logged with the admin's email.
 - **Table editor** binds every value and converts it with the column's type via `json_populate_record`. It identifies rows by primary key (tables without one are read-only), refuses writes to generated columns, and hides internal schemas (`auth`, `admin`, `minibase`, …).
+- **Table designer** turns forms into DDL in the domain layer (`domain/ddl.go`): new names must match `^[a-z_][a-z0-9_]{0,62}$` and are still quoted, types and default expressions come from allow-lists, literal defaults are escaped and run with `standard_conforming_strings` on, and all statements of one change run in one transaction with a 5 s lock timeout. Drops never cascade, and dropping a table needs its name typed back. Every designer endpoint accepts `?preview=1` and returns the SQL without running it; the UI shows that preview live, so server-side validation is also the form's validation. New tables get RLS on by default.
+- **Policy templates** (anyone can read, signed-in users can read or insert, owners manage or read their rows) compile to `CREATE POLICY` for `minibase_anon` / `minibase_authenticated`. Owner templates require a `uuid` column and use `auth.uid()`. A "custom" template takes USING / WITH CHECK expressions (admins can run any SQL anyway).
+- **Data tools.** Row filters (`filter=column:op:value`) bind values and cast them to the column's catalog type. CSV export streams `col::text` per row (NULL becomes an empty field). CSV import maps the header to columns, skips generated columns (so an export can be re-imported), inserts in batches of 500 with `json_populate_recordset` inside **one transaction**, and reports the failing line range. Uploads are bounded by `MINIBASE_HTTP_MAX_BODY_BYTES`; exports and imports get a 10-minute write deadline.
+- **Audit log** (`admin.audit_log`, ADR-0006): sign-ins (and failures), admin changes, SQL runs with the query, schema and policy changes with the SQL, row edits with the key, imports, exports, user deletes. The acting admin travels in the request context (`service.WithActor`); `minibase admin` records as `cli`. SQL history is read back from the log, so there is no second table to keep in sync. Entries older than `MINIBASE_ADMIN_AUDIT_RETENTION` (90 days) are purged hourly. Admins can run SQL, so the log is a record, not tamper-proof.
+- **Managing admins** from the browser: you can't delete yourself, and deleting the last admin is refused atomically (all account rows are locked first). Resetting another admin's password returns a generated one once and signs them out.
+- **Settings and keys.** The kernel's config reader records every variable it or a module reads (`kernel.Settings`), with secrets masked by name (`*_URL` passwords redacted, `*SECRET*`/`*PASSWORD*` hidden, `*_KEY` other than `ANON_KEY` shortened). The dashboard shows that record, so modules never report settings themselves and new settings appear automatically.
 - **Module boundaries:** user management goes through `ports.UserDirectory` (provided by `auth`), never `auth.*` tables. Schema edits publish `ports.EventSchemaChanged`, which makes the `database` module reload its catalog cache. `database` also re-checks the catalog once before refusing a table it believes has no RLS.
 
 ---
@@ -522,7 +539,7 @@ CI (GitHub Actions): lint → unit → integration → build image → e2e → p
 | **1 — Auth + Database** ✅ | Email/password, JWT, refresh rotation, API keys; REST CRUD with RLS | SDK can sign up and CRUD its own rows; another user cannot read them |
 | **2 — Storage** | Buckets, local driver, signed URLs, RLS on objects; S3 driver | Upload/download via SDK with policies |
 | **3 — Realtime** | WS hub, db change channels, broadcast, presence | SDK receives inserts on a table filtered by RLS |
-| **Dashboard** ✅ | `admin` module, built early (ahead of Phases 2–3) | Manage tables, RLS, SQL and users from the browser |
+| **Dashboard** ✅ | `admin` module, built early (ahead of Phases 2–3): editor, designer, policy templates, CSV, snippets, API docs, audit log, admins | Build a table, secure it and call it from an app without writing SQL |
 | **4 — DX** | JS SDK v1, docs site, OAuth providers, magic link; storage and realtime pages in the dashboard | New user to working app in < 10 minutes |
 | **5 — Extensions** | `hooks` module, Prometheus metrics, logical-replication change source | — |
 
@@ -533,4 +550,4 @@ CI (GitHub Actions): lint → unit → integration → build image → e2e → p
 1. **Project name / Go module path** — `github.com/<you>/mini-base`? Needed before Phase 0.
 2. **Licence** — Apache-2.0 (patent grant, business-friendly) vs MIT (simplest). Recommendation: Apache-2.0.
 3. **SQLite "lite mode"** — worth a v2 spike? Would require app-level policies instead of RLS (see ADR-0002).
-4. **Admin UI framework** — SvelteKit proposed for bundle size; React if contributors prefer.
+4. ~~Admin UI framework~~ — decided: Preact + htm without a build step (ADR-0005).

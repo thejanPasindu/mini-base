@@ -7,12 +7,13 @@ class APIError extends Error {
   constructor(message, status, code) { super(message); this.status = status; this.code = code; }
 }
 
-async function api(method, path, body) {
+async function api(method, path, body, contentType) {
   const headers = { 'X-Minibase-Admin': '1' };
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const raw = body instanceof Blob;
+  if (body !== undefined) headers['Content-Type'] = raw ? (contentType || 'application/octet-stream') : 'application/json';
   const res = await fetch('api' + path, {
     method, headers, credentials: 'same-origin',
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => null);
@@ -25,6 +26,16 @@ async function api(method, path, body) {
 
 const enc = encodeURIComponent;
 const tablePath = (schema, name) => `/tables/${enc(schema)}/${enc(name)}`;
+const tableHref = (schema, name, tab) => `#/tables/${enc(schema)}/${enc(name)}${tab ? '/' + tab : ''}`;
+
+// Settings rarely change while the dashboard is open; fetch them once.
+let settingsPromise = null;
+function getSettings() {
+  settingsPromise ||= api('GET', '/settings').catch((err) => { settingsPromise = null; throw err; });
+  return settingsPromise;
+}
+
+const ROLE_NAMES = { minibase_anon: 'anon', minibase_authenticated: 'signed-in users', public: 'everyone' };
 
 // ------------------------------------------------------------ helpers ----
 
@@ -62,6 +73,36 @@ const fmtBytes = (n) => {
 };
 const fmtDate = (s) => (s ? new Date(s).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Never');
 const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+const sqlText = (stmts) => stmts.map((st) => st + ';').join('\n\n');
+
+async function copy(text, what = 'Copied') {
+  try { await navigator.clipboard.writeText(text); toast(what); } catch { toast('Copy failed; select the text instead', true); }
+}
+
+function CopyButton({ text, label = 'Copy', what }) {
+  return html`<button type="button" class="small" onClick=${() => copy(text, what)}>${label}</button>`;
+}
+
+// usePreview asks the server for the SQL a form would run (?preview=1),
+// shortly after the form stops changing. Errors double as validation.
+function usePreview(fn, deps, enabled = true) {
+  const [state, setState] = useState({ sql: '', error: '' });
+  useEffect(() => {
+    if (!enabled) { setState({ sql: '', error: '' }); return undefined; }
+    let live = true;
+    const t = setTimeout(() => fn().then(
+      (r) => live && setState({ sql: sqlText(r.sql), error: '' }),
+      (err) => live && setState({ sql: '', error: err.message })), 300);
+    return () => { live = false; clearTimeout(t); };
+  }, [...deps, enabled]);
+  return state;
+}
+
+function SQLPreview({ preview, idle }) {
+  if (preview.error) return html`<p class="preview-note error-text">${preview.error}</p>`;
+  if (!preview.sql) return idle ? html`<p class="preview-note">${idle}</p>` : null;
+  return html`<div class="sql-preview"><small>Will run</small><pre>${preview.sql}</pre></div>`;
+}
 
 function display(v) {
   if (v === null || v === undefined) return html`<span class="null">null</span>`;
@@ -119,10 +160,8 @@ function SignIn({ onSignedIn }) {
 // ------------------------------------------------------------- shell -----
 
 const SECTIONS = [
-  ['overview', 'Overview'],
-  ['tables', 'Tables'],
-  ['sql', 'SQL editor'],
-  ['users', 'Users'],
+  [['overview', 'Overview'], ['tables', 'Tables'], ['sql', 'SQL editor'], ['users', 'Users']],
+  [['api', 'API and keys'], ['audit', 'Audit log'], ['admins', 'Admins'], ['settings', 'Settings']],
 ];
 
 function Shell({ account, route, onSignOut, children }) {
@@ -132,8 +171,10 @@ function Shell({ account, route, onSignOut, children }) {
       <aside class="rail">
         <div class="wordmark"><i></i>mini-base</div>
         <nav aria-label="Sections">
-          ${SECTIONS.map(([id, label]) => html`
-            <a href=${'#/' + id} aria-current=${route[0] === id ? 'page' : undefined}>${label}</a>`)}
+          ${SECTIONS.map((group, i) => html`
+            ${i > 0 && html`<hr />`}
+            ${group.map(([id, label]) => html`
+              <a href=${'#/' + id} aria-current=${route[0] === id ? 'page' : undefined}>${label}</a>`)}`)}
         </nav>
         <div class="who">
           <span class="email" title=${account.email}>${account.email}</span>
@@ -225,7 +266,8 @@ function Overview() {
 // ------------------------------------------------------------- tables ----
 
 function Tables({ route }) {
-  const [, schema, name] = route;
+  const [, schema, name, tab] = route;
+  const designing = schema === 'new' && name === undefined;
   const [{ loading, data, error }, reload] = useLoad(() => api('GET', '/tables'), []);
   const [filter, setFilter] = useState('');
 
@@ -239,16 +281,20 @@ function Tables({ route }) {
   if (error) return html`<${Failed} error=${error} retry=${reload} />`;
   const tables = data.tables.filter((t) => `${t.schema}.${t.name}`.includes(filter.trim().toLowerCase()));
 
-  if (data.tables.length === 0) {
+  if (data.tables.length === 0 && !designing) {
     return html`
       <div class="page-head"><div><h1>Tables</h1></div></div>
       <div class="empty"><h3>No tables yet</h3>
-        <p>Create one in the <a href="#/sql">SQL editor</a>. Tables in the <code>public</code> schema are served at <code>/rest/v1/<i>table</i></code>.</p></div>`;
+        <p>Tables in the <code>public</code> schema are served at <code>/rest/v1/<i>table</i></code>.</p>
+        <p style="margin-top:12px"><a class="button primary" href="#/tables/new">New table</a></p></div>`;
   }
   return html`
     <div class="split">
       <div class="table-list">
-        <input type="search" placeholder="Filter tables" aria-label="Filter tables" value=${filter} onInput=${(e) => setFilter(e.target.value)} />
+        <div class="list-head">
+          <input type="search" placeholder="Filter tables" aria-label="Filter tables" value=${filter} onInput=${(e) => setFilter(e.target.value)} />
+          <a class="button" href="#/tables/new" aria-current=${designing ? 'page' : undefined}>New</a>
+        </div>
         <ul>
           ${tables.map((t) => html`
             <li><a href=${`#/tables/${enc(t.schema)}/${enc(t.name)}`} aria-current=${t.schema === schema && t.name === name ? 'page' : undefined}>
@@ -260,17 +306,23 @@ function Tables({ route }) {
         <div class="legend"><span><i class="rls"></i>RLS on</span><span><i class="rls off"></i>RLS off</span></div>
       </div>
       <div>
-        ${schema
-          ? html`<${TableDetail} key=${schema + '.' + name} schema=${schema} name=${name} onChanged=${reload} />`
-          : html`<div class="empty"><h3>Choose a table</h3><p>Browse and edit its rows, see its columns and its row level security policies.</p></div>`}
+        ${designing
+          ? html`<${TableDesigner} tables=${data.tables} onCreated=${reload} />`
+          : schema
+            ? html`<${TableDetail} key=${schema + '.' + name} schema=${schema} name=${name} tab=${tab} onChanged=${reload} />`
+            : html`<div class="empty"><h3>Choose a table</h3><p>Browse and edit its rows, see its columns and its row level security policies, or create a new table.</p></div>`}
       </div>
     </div>`;
 }
 
-function TableDetail({ schema, name, onChanged }) {
+const TABS = ['rows', 'structure', 'policies', 'api'];
+
+function TableDetail({ schema, name, tab: routeTab, onChanged }) {
   const [{ loading, data, error }, reload] = useLoad(() => api('GET', tablePath(schema, name)), [schema, name]);
-  const [tab, setTab] = useState('rows');
+  const tab = TABS.includes(routeTab) ? routeTab : 'rows';
+  const setTab = (t) => { location.hash = tableHref(schema, name, t === 'rows' ? '' : t); };
   const [busy, setBusy] = useState(false);
+  const changed = () => { reload(); onChanged(); };
 
   if (loading && !data) return html`<${Loading} />`;
   if (error) return html`<${Failed} error=${error} retry=${reload} />`;
@@ -305,45 +357,87 @@ function TableDetail({ schema, name, onChanged }) {
       </div>`}
 
     <div class="tabs" role="tablist">
-      ${[['rows', 'Rows'], ['structure', 'Structure'], ['policies', `Policies (${table.policy_list.length})`]].map(([id, label]) => html`
+      ${[['rows', 'Rows'], ['structure', 'Structure'], ['policies', `Policies (${table.policy_list.length})`], ['api', 'API']].map(([id, label]) => html`
         <button role="tab" aria-selected=${tab === id} onClick=${() => setTab(id)}>${label}</button>`)}
     </div>
 
-    ${tab === 'rows' && html`<${Rows} table=${table} editable=${editable} pk=${pk} />`}
-    ${tab === 'structure' && html`<${Structure} table=${table} />`}
-    ${tab === 'policies' && html`<${Policies} table=${table} />`}`;
+    ${tab === 'rows' && html`<${Rows} table=${table} editable=${editable} pk=${pk} onChanged=${changed} />`}
+    ${tab === 'structure' && html`<${Structure} table=${table} onChanged=${changed} />`}
+    ${tab === 'policies' && html`<${Policies} table=${table} onChanged=${changed} />`}
+    ${tab === 'api' && html`<${TableAPI} table=${table} pk=${pk} />`}`;
 }
 
 const PAGE = 50;
 
-function Rows({ table, editable, pk }) {
+const FILTER_OPS = [
+  ['eq', 'equals'], ['neq', 'is not'], ['contains', 'contains'], ['lt', 'less than'], ['lte', 'at most'],
+  ['gt', 'greater than'], ['gte', 'at least'], ['is_null', 'is null'], ['not_null', 'is not null'],
+];
+const valueless = (op) => op === 'is_null' || op === 'not_null';
+
+function Rows({ table, editable, pk, onChanged }) {
   const [page, setPage] = useState(0);
   const [sort, setSort] = useState(null); // { column, desc }
   const [editing, setEditing] = useState(null); // { row } or { row: null } for a new row
+  const [filters, setFilters] = useState([]); // { column, op, value }
+  const [applied, setApplied] = useState([]);
+  const [importing, setImporting] = useState(false);
   const path = tablePath(table.schema, table.name);
-  const query = `?limit=${PAGE}&offset=${page * PAGE}${sort ? `&sort=${enc(sort.column)}&dir=${sort.desc ? 'desc' : 'asc'}` : ''}`;
+
+  // Apply filter edits shortly after typing stops; skip rows still missing a value.
+  useEffect(() => {
+    const t = setTimeout(() => { setPage(0); setApplied(filters.filter((f) => valueless(f.op) || f.value !== '')); }, 350);
+    return () => clearTimeout(t);
+  }, [filters]);
+
+  const filterQS = applied.map((f) => `&filter=${enc(`${f.column}:${f.op}:${valueless(f.op) ? '' : f.value}`)}`).join('');
+  const sortQS = sort ? `&sort=${enc(sort.column)}&dir=${sort.desc ? 'desc' : 'asc'}` : '';
+  const query = `?limit=${PAGE}&offset=${page * PAGE}${sortQS}${filterQS}`;
+  const exportHref = `api${path}/export?x=1${sortQS}${filterQS}`;
   const [{ loading, data, error }, reload] = useLoad(() => api('GET', path + '/rows' + query), [path, query]);
+  const setFilter = (i, patch) => setFilters((fs) => fs.map((f, j) => (j === i ? { ...f, ...patch } : f)));
 
   const toggleSort = (column) => {
     setPage(0);
     setSort((s) => (!s || s.column !== column ? { column, desc: false } : s.desc ? null : { column, desc: true }));
   };
 
-  if (error) return html`<${Failed} error=${error} retry=${reload} />`;
   const rows = data?.rows || [];
-  const total = data?.total ?? 0;
-  const from = total === 0 ? 0 : page * PAGE + 1;
-  const to = Math.min((page + 1) * PAGE, total);
+  const unknownTotal = data?.total === -1;
+  const total = unknownTotal ? Infinity : (data?.total ?? 0);
+  const from = rows.length === 0 ? 0 : page * PAGE + 1;
+  const to = page * PAGE + rows.length;
+  const of = unknownTotal ? 'many' : `${data?.total_exact === false ? 'about ' : ''}${(data?.total ?? 0).toLocaleString()}`;
 
   return html`
-    <div class="toolbar">
+    <div class="toolbar wrap">
       ${table.kind === 'table' && html`<button class="primary" onClick=${() => setEditing({ row: null })}>Add row</button>`}
-      ${table.kind === 'table' && !editable && html`<span class="range">Add a primary key to edit or delete rows here.</span>`}
+      <button onClick=${() => setFilters([...filters, { column: table.columns[0]?.name, op: 'eq', value: '' }])}>Filter</button>
+      <a class="button" href=${exportHref} download>Export CSV</a>
+      ${table.kind === 'table' && html`<button onClick=${() => setImporting(true)}>Import CSV</button>`}
       <span class="spacer"></span>
-      <span class="range">${from.toLocaleString()}–${to.toLocaleString()} of ${data?.total_exact === false ? 'about ' : ''}${total.toLocaleString()}</span>
+      <span class="range">${from.toLocaleString()}–${to.toLocaleString()} of ${of}</span>
       <button class="small" disabled=${page === 0} onClick=${() => setPage(page - 1)}>Previous</button>
-      <button class="small" disabled=${to >= total} onClick=${() => setPage(page + 1)}>Next</button>
+      <button class="small" disabled=${to >= total || rows.length < PAGE} onClick=${() => setPage(page + 1)}>Next</button>
     </div>
+    ${filters.length > 0 && html`
+      <div class="filters">
+        ${filters.map((f, i) => html`
+          <div class="filter">
+            <span class="where">${i === 0 ? 'Where' : 'and'}</span>
+            <select aria-label="Column" value=${f.column} onChange=${(e) => setFilter(i, { column: e.target.value })}>
+              ${table.columns.map((c) => html`<option value=${c.name}>${c.name}</option>`)}
+            </select>
+            <select aria-label="Condition" value=${f.op} onChange=${(e) => setFilter(i, { op: e.target.value })}>
+              ${FILTER_OPS.map(([op, label]) => html`<option value=${op}>${label}</option>`)}
+            </select>
+            ${!valueless(f.op) && html`<input class="mono" aria-label="Value" placeholder="value" value=${f.value}
+              onInput=${(e) => setFilter(i, { value: e.target.value })} />`}
+            <button class="small quiet" aria-label="Remove filter" onClick=${() => setFilters(filters.filter((_, j) => j !== i))}>Remove</button>
+          </div>`)}
+      </div>`}
+    ${table.kind === 'table' && !editable && html`<p class="hint">Add a primary key to edit or delete rows here.</p>`}
+    ${error && html`<${Failed} error=${error} retry=${reload} />`}
     <div class="grid-wrap">
       <table class="grid">
         <thead><tr>${table.columns.map((c) => html`
@@ -360,12 +454,47 @@ function Rows({ table, editable, pk }) {
             </tr>`)}
         </tbody>
       </table>
-      ${!loading && rows.length === 0 && html`<div class="empty"><h3>No rows</h3>
-        <p>${table.kind === 'table' ? 'Add one here, or through the REST API.' : 'This view returns no rows.'}</p></div>`}
+      ${!loading && !error && rows.length === 0 && html`<div class="empty"><h3>${applied.length ? 'No rows match' : 'No rows'}</h3>
+        <p>${applied.length ? 'Change or remove a filter.' : table.kind === 'table' ? 'Add one here, import a CSV file, or use the REST API.' : 'This view returns no rows.'}</p></div>`}
       ${loading && !data && html`<${Loading} />`}
     </div>
     ${editing && html`<${RowDrawer} table=${table} pk=${pk} row=${editing.row} path=${path}
-      onClose=${() => setEditing(null)} onSaved=${() => { setEditing(null); reload(); }} />`}`;
+      onClose=${() => setEditing(null)} onSaved=${() => { setEditing(null); reload(); }} />`}
+    ${importing && html`<${ImportDialog} table=${table} path=${path}
+      onClose=${() => setImporting(false)} onImported=${() => { setImporting(false); reload(); onChanged(); }} />`}`;
+}
+
+function ImportDialog({ table, path, onClose, onImported }) {
+  const ref = useRef();
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { ref.current.showModal(); }, []);
+  const writable = table.columns.filter((c) => !c.generated).map((c) => c.name);
+  const submit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const file = f.get('file');
+    if (!file || !file.size) { setError('Choose a CSV file.'); return; }
+    setBusy(true); setError('');
+    try {
+      const r = await api('POST', `${path}/import?empty=${f.get('empty') ? 'null' : 'string'}`, file, 'text/csv');
+      toast(`Imported ${plural(r.rows, 'row', 'rows')}${r.ignored.length ? `; skipped ${r.ignored.join(', ')} (set by the database)` : ''}`);
+      onImported();
+    } catch (err) { setError(err.message); setBusy(false); }
+  };
+  return html`
+    <dialog ref=${ref} onClose=${onClose}>
+      <form onSubmit=${submit}>
+        <h2>Import rows into ${table.name}</h2>
+        <p class="muted">The first line must name the columns, for example <code>${writable.slice(0, 3).join(',')}</code>.
+          Columns you leave out get their defaults. Every row is added, or none if one fails.</p>
+        <label class="field"><span>CSV file</span><input name="file" type="file" accept=".csv,text/csv" required /></label>
+        <label class="check"><input type="checkbox" name="empty" checked /> Treat empty cells as null</label>
+        ${error && html`<p class="error-text" role="alert">${error}</p>`}
+        <div class="row"><button type="button" onClick=${onClose}>Cancel</button>
+          <button class="primary" disabled=${busy}>${busy ? 'Importing…' : 'Import'}</button></div>
+      </form>
+    </dialog>`;
 }
 
 // Values are sent as JSON. Postgres converts them with each column's type
@@ -462,51 +591,437 @@ function RowDrawer({ table, pk, row, path, onClose, onSaved }) {
     </form>`;
 }
 
-function Structure({ table }) {
+function Structure({ table, onChanged }) {
+  const [adding, setAdding] = useState(false);
+  const [confirm, setConfirm] = useState(null);
+  const path = tablePath(table.schema, table.name);
+  const isTable = table.kind === 'table';
+  const drop = async (col) => {
+    if (confirm !== col) { setConfirm(col); return; }
+    try {
+      await api('DELETE', `${path}/columns/${enc(col)}`);
+      toast(`Dropped column ${col}`); setConfirm(null); onChanged();
+    } catch (err) { toast(err.message, true); }
+  };
   return html`
+    ${isTable && html`<div class="toolbar"><button class=${adding ? '' : 'primary'} onClick=${() => setAdding(!adding)}>${adding ? 'Close' : 'Add column'}</button></div>`}
+    ${adding && html`<${AddColumn} table=${table} path=${path} onAdded=${() => { setAdding(false); onChanged(); }} />`}
     <table class="plain">
-      <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th></tr></thead>
+      <thead><tr><th>Column</th><th>Type</th><th>Nullable</th><th>Default</th>${isTable && html`<th></th>`}</tr></thead>
       <tbody>${table.columns.map((c) => html`
         <tr>
           <td><code>${c.name}</code>${c.primary_key ? html` <span class="chip">primary key</span>` : ''}${c.generated ? html` <span class="chip">generated</span>` : ''}</td>
           <td><code>${c.type}</code></td>
           <td>${c.nullable ? 'Yes' : 'No'}</td>
           <td>${c.default ? html`<code>${c.default}</code>` : html`<span class="null">none</span>`}</td>
+          ${isTable && html`<td style="text-align:right">${!c.primary_key && html`
+            <button class=${'small danger' + (confirm === c.name ? ' confirm' : '')} onClick=${() => drop(c.name)}>
+              ${confirm === c.name ? 'Confirm drop' : 'Drop'}</button>`}</td>`}
         </tr>`)}</tbody>
-    </table>`;
+    </table>
+    <${DropTable} table=${table} path=${path} />`;
 }
 
-function policyTemplate(t) {
-  const q = (s) => `"${s.replace(/"/g, '""')}"`;
-  return `-- Example: each signed-in user can read and change only their own rows.
--- Assumes a user_id uuid column; adjust to your table.
-CREATE POLICY own_rows ON ${q(t.schema)}.${q(t.name)}
-  FOR ALL TO minibase_authenticated
-  USING (user_id = auth.uid())
-  WITH CHECK (user_id = auth.uid());`;
-}
-
-function Policies({ table }) {
-  const openInEditor = () => {
-    try { sessionStorage.setItem('minibase.sql.prefill', policyTemplate(table)); } catch { /* storage unavailable */ }
-    location.hash = '#/sql';
+function AddColumn({ table, path, onAdded }) {
+  const [col, setCol] = useState(blankColumn);
+  const [busy, setBusy] = useState(false);
+  const refs = useRefTargets();
+  const ready = col.name.trim() !== '';
+  const preview = usePreview(() => api('POST', `${path}/columns?preview=1`, columnSpec(col)), [JSON.stringify(col)], ready);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api('POST', `${path}/columns`, columnSpec(col));
+      toast(`Added column ${col.name}`); onAdded();
+    } catch (err) { toast(err.message, true); } finally { setBusy(false); }
   };
+  return html`
+    <form class="designer-card" onSubmit=${submit}>
+      <div class="columns-head" aria-hidden="true"><span>Name</span><span>Type</span><span>Default</span><span>Links to</span><span></span></div>
+      <${ColumnFields} col=${col} onChange=${(p) => setCol({ ...col, ...p })} refs=${refs} />
+      ${!col.nullable && !col.def && html`<p class="hint">A required column without a default can only be added while the table is empty.</p>`}
+      <${SQLPreview} preview=${preview} />
+      <div><button class="primary" disabled=${busy || !ready || !!preview.error}>Add column</button></div>
+    </form>`;
+}
+
+function DropTable({ table, path }) {
+  const [typed, setTyped] = useState('');
+  const [busy, setBusy] = useState(false);
+  const label = table.kind === 'table' ? 'table' : table.kind.replace('_', ' ');
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api('DELETE', path, { confirm: typed });
+      toast(`Dropped ${table.schema}.${table.name}`);
+      window.dispatchEvent(new Event('schema-changed'));
+      location.hash = '#/tables';
+    } catch (err) { toast(err.message, true); setBusy(false); }
+  };
+  return html`
+    <form class="danger-zone" onSubmit=${submit}>
+      <div><h3>Drop this ${label}</h3>
+        <p>Deletes it and all of its rows. This can't be undone. Postgres refuses if other objects depend on it.</p></div>
+      <div class="confirm-row">
+        <input class="mono" aria-label=${`Type ${table.name} to confirm`} placeholder=${table.name} value=${typed} onInput=${(e) => setTyped(e.target.value)} />
+        <button class="danger" disabled=${busy || typed !== table.name}>Drop ${label}</button>
+      </div>
+    </form>`;
+}
+
+function Policies({ table, onChanged }) {
+  const [adding, setAdding] = useState(false);
+  const [confirm, setConfirm] = useState(null);
+  const path = tablePath(table.schema, table.name);
   if (table.kind !== 'table') {
     return html`<div class="empty"><h3>Views don't have policies</h3>
       <p>A view created <code>WITH (security_invoker = true)</code> applies the policies of the tables it reads.</p></div>`;
   }
+  const drop = async (name) => {
+    if (confirm !== name) { setConfirm(name); return; }
+    try {
+      await api('DELETE', `${path}/policies/${enc(name)}`);
+      toast(`Removed policy ${name}`); setConfirm(null); onChanged();
+    } catch (err) { toast(err.message, true); }
+  };
   return html`
+    <div class="toolbar"><button class=${adding ? '' : 'primary'} onClick=${() => setAdding(!adding)}>${adding ? 'Close' : 'Add policy'}</button></div>
+    ${adding && html`<${AddPolicy} table=${table} path=${path} onAdded=${() => { setAdding(false); onChanged(); }} />`}
     ${table.policy_list.length === 0
       ? html`<div class="empty"><h3>No policies</h3>
           <p>${table.rls_enabled ? 'With row level security on and no policies, anon and signed-in requests see no rows at all.' : 'Turn on row level security, then add policies.'}</p></div>`
       : table.policy_list.map((p) => html`
           <div class="policy">
-            <h3><code>${p.name}</code></h3>
-            <p class="meta">${p.command === 'ALL' ? 'All commands' : p.command} for ${p.roles.join(', ')}${p.permissive ? '' : ' (restrictive)'}</p>
+            <div class="policy-head">
+              <h3>${p.name}</h3>
+              <button class=${'small danger' + (confirm === p.name ? ' confirm' : '')} onClick=${() => drop(p.name)}>${confirm === p.name ? 'Confirm remove' : 'Remove'}</button>
+            </div>
+            <p class="meta">${p.command === 'ALL' ? 'All commands' : p.command} for ${(p.roles || []).map((r) => ROLE_NAMES[r] || r).join(', ')}${p.permissive ? '' : ' (restrictive)'}</p>
             ${p.using && html`<div><small>Rows visible when</small><pre>${p.using}</pre></div>`}
             ${p.with_check && html`<div><small>Writes allowed when</small><pre>${p.with_check}</pre></div>`}
-          </div>`)}
-    <p style="margin-top:16px"><button onClick=${openInEditor}>Write a policy in the SQL editor</button></p>`;
+          </div>`)}`;
+}
+
+function AddPolicy({ table, path, onAdded }) {
+  const [{ data: meta }] = useLoad(() => api('GET', '/designer'), []);
+  const uuidCols = table.columns.filter((c) => c.type === 'uuid').map((c) => c.name);
+  const [spec, setSpec] = useState({
+    template: 'owner_all', name: '', column: uuidCols.find((c) => /user|owner/.test(c)) || uuidCols[0] || '',
+    command: 'SELECT', roles: ['authenticated'], using: '', with_check: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const set = (p) => setSpec({ ...spec, ...p });
+  const templates = meta?.policy_templates || [];
+  const tpl = templates.find((t) => t.id === spec.template);
+  const preview = usePreview(() => api('POST', `${path}/policies?preview=1`, spec), [JSON.stringify(spec)], !!meta);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api('POST', `${path}/policies`, spec);
+      toast('Policy added'); onAdded();
+    } catch (err) { toast(err.message, true); } finally { setBusy(false); }
+  };
+  const toggleRole = (r) => set({ roles: spec.roles.includes(r) ? spec.roles.filter((x) => x !== r) : [...spec.roles, r] });
+  return html`
+    <form class="designer-card" onSubmit=${submit}>
+      ${!table.rls_enabled && html`<p class="hint">Row level security is off for this table, so policies have no effect until you turn it on.</p>`}
+      <fieldset class="templates">
+        <legend>Who may do what</legend>
+        ${templates.map((t) => html`
+          <label class=${'template' + (spec.template === t.id ? ' chosen' : '')}>
+            <input type="radio" name="template" value=${t.id} checked=${spec.template === t.id} onChange=${() => set({ template: t.id })} />
+            <span><strong>${t.label}</strong><small>${t.description}</small></span>
+          </label>`)}
+      </fieldset>
+      ${tpl?.needs_column && (uuidCols.length
+        ? html`<label class="field"><span>Owner column</span>
+            <select value=${spec.column} onChange=${(e) => set({ column: e.target.value })}>${uuidCols.map((c) => html`<option value=${c}>${c}</option>`)}</select>
+            <small>Holds the id of the user who owns the row. <code>auth.uid()</code> is the signed-in user's id.</small></label>`
+        : html`<p class="hint">This table has no uuid column to hold the owner's user id. Add one on the Structure tab (for example <code>user_id</code>, default <code>auth.uid()</code>, linked to <code>auth.users</code>).</p>`)}
+      ${spec.template === 'custom' && html`
+        <div class="custom-policy">
+          <label class="field"><span>Command</span>
+            <select value=${spec.command} onChange=${(e) => set({ command: e.target.value })}>
+              ${['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALL'].map((c) => html`<option value=${c}>${c}</option>`)}</select></label>
+          <div class="field"><span>Applies to</span>
+            <label class="check"><input type="checkbox" checked=${spec.roles.includes('anon')} onChange=${() => toggleRole('anon')} /> anon (not signed in)</label>
+            <label class="check"><input type="checkbox" checked=${spec.roles.includes('authenticated')} onChange=${() => toggleRole('authenticated')} /> signed-in users</label></div>
+          ${spec.command !== 'INSERT' && html`<label class="field"><span>Rows visible when (USING)</span>
+            <textarea class="mono" rows="2" placeholder="user_id = auth.uid()" value=${spec.using} onInput=${(e) => set({ using: e.target.value })}></textarea></label>`}
+          ${spec.command !== 'SELECT' && spec.command !== 'DELETE' && html`<label class="field"><span>Writes allowed when (WITH CHECK)</span>
+            <textarea class="mono" rows="2" placeholder="user_id = auth.uid()" value=${spec.with_check} onInput=${(e) => set({ with_check: e.target.value })}></textarea></label>`}
+        </div>`}
+      <label class="field"><span>Policy name</span>
+        <input value=${spec.name} placeholder=${tpl?.label || ''} maxlength="63" onInput=${(e) => set({ name: e.target.value })} /></label>
+      <${SQLPreview} preview=${preview} />
+      <div><button class="primary" disabled=${busy || !!preview.error || !preview.sql}>Add policy</button></div>
+    </form>`;
+}
+
+// ----------------------------------------------------------- designer ----
+
+const blankColumn = () => ({ name: '', type: 'text', nullable: true, unique: false, def: '', defValue: '', ref: '', onDelete: '' });
+
+// columnSpec turns the form state into the API's ColumnSpec.
+function columnSpec(c) {
+  const spec = { name: c.name.trim(), type: c.type, nullable: c.nullable, unique: c.unique };
+  if (c.def === '=value') spec.default = { value: c.defValue };
+  else if (c.def) spec.default = { expression: c.def };
+  if (c.ref) {
+    const [schema, table] = JSON.parse(c.ref);
+    spec.references = { schema, table, column: 'id', on_delete: c.onDelete };
+  }
+  return spec;
+}
+
+const AUTH_USERS = JSON.stringify(['auth', 'users']);
+const DEFAULT_EXPRESSIONS = ['now()', 'current_date', 'gen_random_uuid()', 'auth.uid()'];
+const COLUMN_TYPES = ['text', 'boolean', 'smallint', 'integer', 'bigint', 'numeric', 'real', 'double precision', 'uuid', 'date', 'time',
+  'timestamp', 'timestamptz', 'interval', 'jsonb', 'json', 'bytea', 'inet', 'text[]', 'integer[]', 'bigint[]', 'uuid[]'];
+
+// useRefTargets lists tables a new column can link to (by their id column).
+function useRefTargets() {
+  const [targets, setTargets] = useState([]);
+  useEffect(() => {
+    Promise.all([api('GET', '/tables'), getSettings().catch(() => null)]).then(([t, st]) => {
+      const list = t.tables.filter((x) => x.kind === 'table').map((x) => ({ value: JSON.stringify([x.schema, x.name]), label: `${x.schema}.${x.name}` }));
+      if (st?.server.modules.includes('auth')) list.unshift({ value: AUTH_USERS, label: 'auth.users' });
+      setTargets(list);
+    }, () => {});
+  }, []);
+  return targets;
+}
+
+function ColumnFields({ col, onChange, refs, onRemove }) {
+  return html`
+    <div class="column-row">
+      <input class="mono" aria-label="Column name" placeholder="column_name" value=${col.name} onInput=${(e) => onChange({ name: e.target.value })} />
+      <select aria-label="Type" value=${col.type} onChange=${(e) => onChange({ type: e.target.value })}>
+        ${COLUMN_TYPES.map((t) => html`<option value=${t}>${t}</option>`)}
+      </select>
+      <div class="pair">
+        <select aria-label="Default" value=${col.def} onChange=${(e) => onChange({ def: e.target.value })}>
+          <option value="">No default</option>
+          <option value="=value">A value…</option>
+          ${DEFAULT_EXPRESSIONS.map((d) => html`<option value=${d}>${d}</option>`)}
+        </select>
+        ${col.def === '=value' && html`<input class="mono" aria-label="Default value" placeholder="value" value=${col.defValue} onInput=${(e) => onChange({ defValue: e.target.value })} />`}
+      </div>
+      <div class="pair">
+        <select aria-label="Links to" value=${col.ref} onChange=${(e) => onChange({ ref: e.target.value })}>
+          <option value="">Nothing</option>
+          ${refs.map((r) => html`<option value=${r.value}>${r.label}</option>`)}
+        </select>
+        ${col.ref && html`<select aria-label="When the linked row is deleted" title="When the linked row is deleted" value=${col.onDelete} onChange=${(e) => onChange({ onDelete: e.target.value })}>
+          <option value="">Block delete</option><option value="cascade">Cascade delete</option><option value="set null">Set null</option></select>`}
+      </div>
+      <div class="flags">
+        <label class="check"><input type="checkbox" checked=${!col.nullable} onChange=${(e) => onChange({ nullable: !e.target.checked })} /> Required</label>
+        <label class="check"><input type="checkbox" checked=${col.unique} onChange=${(e) => onChange({ unique: e.target.checked })} /> Unique</label>
+        ${onRemove && html`<button type="button" class="small quiet" onClick=${onRemove}>Remove</button>`}
+      </div>
+    </div>`;
+}
+
+function TableDesigner({ tables, onCreated }) {
+  const [{ data: meta, error }] = useLoad(() => api('GET', '/designer'), []);
+  const [settings, setSettings] = useState(null);
+  useEffect(() => { getSettings().then(setSettings, () => {}); }, []);
+  const refs = useRefTargets();
+  const [spec, setSpec] = useState({ schema: 'public', name: '', primary_key: 'bigint', timestamps: true, enable_rls: true });
+  const [cols, setCols] = useState([blankColumn()]);
+  const [busy, setBusy] = useState(false);
+  const hasAuth = settings?.server.modules.includes('auth');
+
+  const body = { ...spec, name: spec.name.trim(), columns: cols.filter((c) => c.name.trim() !== '').map(columnSpec) };
+  const ready = body.name !== '';
+  const preview = usePreview(() => api('POST', '/tables?preview=1', body), [JSON.stringify(body)], ready);
+
+  const setCol = (i, patch) => setCols(cols.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  const addOwner = () => setCols([...cols.filter((c) => c.name.trim() !== ''),
+    { ...blankColumn(), name: 'user_id', type: 'uuid', nullable: false, def: 'auth.uid()', ref: AUTH_USERS, onDelete: 'cascade' }]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api('POST', '/tables', body);
+      toast(`Created ${body.schema}.${body.name}`);
+      onCreated();
+      location.hash = tableHref(body.schema, body.name, 'policies');
+    } catch (err) { toast(err.message, true); setBusy(false); }
+  };
+  if (error) return html`<${Failed} error=${error} />`;
+  const exposed = settings ? settings.rest_schemas.includes(spec.schema) : true;
+  const taken = tables.some((t) => t.schema === spec.schema && t.name === body.name);
+
+  return html`
+    <form class="designer" onSubmit=${submit}>
+      <div class="page-head"><div><h1>New table</h1>
+        <p>Names use lowercase letters, digits and underscores, so API clients never need to quote them.</p></div></div>
+
+      <div class="designer-grid">
+        <label class="field"><span>Schema</span>
+          <select value=${spec.schema} onChange=${(e) => setSpec({ ...spec, schema: e.target.value })}>
+            ${(meta?.schemas || ['public']).map((sc) => html`<option value=${sc}>${sc}</option>`)}</select>
+          ${!exposed && html`<small>Not served by the REST API. Add it to <code>MINIBASE_DATABASE_SCHEMAS</code> to expose it.</small>`}</label>
+        <label class="field"><span>Name</span>
+          <input class="mono" placeholder="todos" autofocus value=${spec.name} onInput=${(e) => setSpec({ ...spec, name: e.target.value })} />
+          ${taken && html`<small class="error-text">A table with this name already exists.</small>`}</label>
+        <label class="field"><span>Primary key</span>
+          <select value=${spec.primary_key} onChange=${(e) => setSpec({ ...spec, primary_key: e.target.value })}>
+            <option value="bigint">id, a number the database assigns</option>
+            <option value="uuid">id, a random uuid</option>
+            <option value="none">No primary key</option></select></label>
+      </div>
+
+      <section class="designer-card">
+        <h2>Columns</h2>
+        <div class="columns-head" aria-hidden="true"><span>Name</span><span>Type</span><span>Default</span><span>Links to</span><span></span></div>
+        ${spec.primary_key !== 'none' && html`<div class="column-fixed"><code>id</code><span>${spec.primary_key === 'uuid' ? 'uuid, gen_random_uuid()' : 'bigint, numbered automatically'}</span></div>`}
+        ${cols.map((c, i) => html`<${ColumnFields} key=${i} col=${c} refs=${refs} onChange=${(p) => setCol(i, p)}
+          onRemove=${cols.length > 1 ? () => setCols(cols.filter((_, j) => j !== i)) : null} />`)}
+        ${spec.timestamps && html`<div class="column-fixed"><code>created_at</code><span>timestamptz, now()</span></div>`}
+        <div class="row-actions">
+          <button type="button" class="small" onClick=${() => setCols([...cols, blankColumn()])}>Add column</button>
+          ${hasAuth && !cols.some((c) => c.name === 'user_id') && html`<button type="button" class="small" onClick=${addOwner}>Add owner column (user_id)</button>`}
+        </div>
+      </section>
+
+      <div class="designer-options">
+        <label class="check"><input type="checkbox" checked=${spec.timestamps} onChange=${(e) => setSpec({ ...spec, timestamps: e.target.checked })} /> Add <code>created_at</code></label>
+        <label class="check"><input type="checkbox" checked=${spec.enable_rls} onChange=${(e) => setSpec({ ...spec, enable_rls: e.target.checked })} /> Turn on row level security</label>
+        ${!spec.enable_rls && html`<p class="hint">Without row level security the API refuses anon and signed-in requests to this table.</p>`}
+      </div>
+
+      <${SQLPreview} preview=${preview} idle="Name the table to see the SQL." />
+      <div class="row-actions"><button class="primary" disabled=${busy || !ready || !!preview.error || taken}>Create table</button>
+        <a class="button" href="#/tables">Cancel</a></div>
+      <p class="muted">Next you'll choose who may read and write its rows.</p>
+    </form>`;
+}
+
+// ---------------------------------------------------------------- API ----
+
+// curl and fetch examples for one table, built from its columns.
+function sampleValue(c) {
+  if (/\[\]$/.test(c.type)) return [];
+  if (/^(smallint|integer|bigint)$/.test(c.type)) return 1;
+  if (/^(numeric|real|double precision)$/.test(c.type)) return 1.5;
+  if (c.type === 'boolean') return true;
+  if (/^jsonb?$/.test(c.type)) return {};
+  if (c.type === 'uuid') return '00000000-0000-0000-0000-000000000000';
+  if (/^timestamp/.test(c.type)) return new Date().toISOString();
+  if (c.type === 'date') return new Date().toISOString().slice(0, 10);
+  return 'text';
+}
+
+function examples(table, pk, settings, lang) {
+  const base = `${location.origin}/rest/v1/${table.name}`;
+  const writable = table.columns.filter((c) => !c.generated && !c.default && c.name !== 'created_at');
+  const body = Object.fromEntries((writable.length ? writable : table.columns.filter((c) => !c.generated)).slice(0, 4).map((c) => [c.name, sampleValue(c)]));
+  const key = pk[0] || table.columns[0]?.name || 'id';
+  const cols = table.columns.slice(0, 3).map((c) => c.name).join(',');
+  const firstText = table.columns.find((c) => c.type === 'text')?.name;
+  const bodyJSON = JSON.stringify(body);
+  const patch = JSON.stringify(Object.fromEntries(Object.entries(body).slice(0, 1)));
+  const items = [
+    ['Read rows', 'GET', `?select=${cols}&order=${key}.desc&limit=20`, null],
+    ...(firstText ? [['Filter', 'GET', `?${firstText}=ilike.*milk*`, null]] : []),
+    ['Insert a row', 'POST', '', bodyJSON],
+    ['Update matching rows', 'PATCH', `?${key}=eq.1`, patch],
+    ['Delete matching rows', 'DELETE', `?${key}=eq.1`, null],
+  ];
+  return items.map(([title, method, qs, data]) => {
+    if (lang === 'curl') {
+      const lines = [`curl${method === 'GET' ? '' : ` -X ${method}`} '${base}${qs}'`, `  -H "apikey: $ANON_KEY"`, `  -H "Authorization: Bearer $ACCESS_TOKEN"`];
+      if (data) lines.push(`  -H 'Content-Type: application/json' -H 'Prefer: return=representation'`, `  -d '${data}'`);
+      return [title, lines.join(' \\\n')];
+    }
+    const opts = [`method: '${method}'`, `headers: {\n    apikey: ANON_KEY,\n    Authorization: \`Bearer \${accessToken}\`,${data ? `\n    'Content-Type': 'application/json',\n    Prefer: 'return=representation',` : ''}\n  }`];
+    if (data) opts.push(`body: JSON.stringify(${data})`);
+    return [title, `const res = await fetch('${base}${qs}', {\n  ${opts.join(',\n  ')},\n});\nconst rows = await res.json();`];
+  });
+}
+
+function TableAPI({ table, pk }) {
+  const [settings, setSettings] = useState(null);
+  const [error, setError] = useState(null);
+  const [lang, setLang] = useState('curl');
+  useEffect(() => { getSettings().then(setSettings, setError); }, []);
+  if (error) return html`<${Failed} error=${error} />`;
+  if (!settings) return html`<${Loading} />`;
+  const mods = settings.server.modules;
+  const exposed = settings.rest_schemas.includes(table.schema);
+  return html`
+    <div class="api-doc">
+      ${!mods.includes('database')
+        ? html`<p class="hint">The REST API is off. Add <code>database</code> to <code>MINIBASE_MODULES</code> to serve this table.</p>`
+        : !exposed
+          ? html`<p class="hint">The <code>${table.schema}</code> schema isn't served by the API. Add it to <code>MINIBASE_DATABASE_SCHEMAS</code>.</p>`
+          : table.kind === 'table' && !table.rls_enabled
+            ? html`<p class="hint">Row level security is off, so these requests are refused unless they use the service key.</p>`
+            : null}
+      <p class="muted">Endpoint <code>/rest/v1/${table.name}</code>. <code>ANON_KEY</code> is on the <a href="#/api">API and keys</a> page.
+        The access token comes from signing in; without it, requests run as anon. Your policies decide which rows each caller sees.</p>
+      <div class="seg" role="group" aria-label="Example language">
+        ${[['curl', 'curl'], ['js', 'JavaScript']].map(([id, label]) => html`<button aria-pressed=${lang === id} onClick=${() => setLang(id)}>${label}</button>`)}
+      </div>
+      ${examples(table, pk, settings, lang).map(([title, code]) => html`
+        <div class="example"><div class="example-head"><h3>${title}</h3><${CopyButton} text=${code} /></div><pre>${code}</pre></div>`)}
+      <p class="muted">More query options: <code>select</code>, <code>eq</code>, <code>neq</code>, <code>gt</code>, <code>lte</code>, <code>ilike</code>, <code>in.(1,2)</code>, <code>is.null</code>, <code>not.</code>, <code>order</code>, <code>limit</code>, <code>offset</code>. See the getting started guide.</p>
+    </div>`;
+}
+
+function APIPage() {
+  const [{ loading, data, error }, reload] = useLoad(() => getSettings(), []);
+  const [tables, setTables] = useState([]);
+  useEffect(() => { api('GET', '/tables').then((r) => setTables(r.tables), () => {}); }, []);
+  if (loading && !data) return html`<${Loading} />`;
+  if (error) return html`<${Failed} error=${error} retry=${reload} />`;
+  const mods = data.server.modules;
+  const auth = (path, body) => `curl -X POST '${location.origin}/auth/v1/${path}' \\\n  -H "apikey: $ANON_KEY" -H 'Content-Type: application/json' \\\n  -d '${body}'`;
+  const signup = auth('signup', '{"email":"you@example.com","password":"correct horse battery"}');
+  const signin = auth('token?grant_type=password', '{"email":"you@example.com","password":"correct horse battery"}');
+  const exposed = tables.filter((t) => data.rest_schemas.includes(t.schema));
+  return html`
+    <div class="page-head"><div><h1>API and keys</h1>
+      <p>Apps send a key in the <code>apikey</code> header of every request, plus a user's access token once they sign in.</p></div></div>
+    <div class="report">
+      <section class="section">
+        <h2>Connection</h2>
+        <dl class="facts keys">
+          <dt>URL</dt><dd><code>${location.origin}</code> <${CopyButton} text=${location.origin} what="URL copied" /></dd>
+          <dt>Anon key</dt>
+          <dd>${data.anon_key
+            ? html`<code class="key">${data.anon_key}</code> <${CopyButton} text=${data.anon_key} what="Anon key copied" />
+              <small>Safe to ship in browser and mobile apps. Requests with it can only do what your row level security policies allow.</small>`
+            : html`<span class="null">not set</span>`}</dd>
+          <dt>Service key</dt>
+          <dd>${data.service_key ? html`<code>${data.service_key}</code>` : html`<span class="null">not set</span>`}
+            <small>Bypasses row level security. Use it only on servers you control. It's in your <code>.env</code> as <code>MINIBASE_SERVICE_KEY</code>; the dashboard never shows it in full.</small></dd>
+        </dl>
+      </section>
+      ${mods.includes('auth') && html`
+        <section class="section">
+          <h2>Sign users in</h2>
+          <div class="example"><div class="example-head"><h3>Sign up</h3><${CopyButton} text=${signup} /></div><pre>${signup}</pre></div>
+          <div class="example"><div class="example-head"><h3>Sign in</h3><${CopyButton} text=${signin} /></div><pre>${signin}</pre></div>
+          <p class="muted">Both return an <code>access_token</code> (send it as <code>Authorization: Bearer</code>) and a <code>refresh_token</code>.</p>
+        </section>`}
+      <section class="section">
+        <h2>Tables</h2>
+        ${!mods.includes('database')
+          ? html`<p class="muted">The REST API is off. Add <code>database</code> to <code>MINIBASE_MODULES</code>.</p>`
+          : exposed.length === 0
+            ? html`<p class="muted">No tables in ${data.rest_schemas.join(', ')} yet. <a href="#/tables/new">Create one</a>.</p>`
+            : html`<ul class="link-list">${exposed.map((t) => html`<li><${RLSMark} table=${t} />
+                <a href=${tableHref(t.schema, t.name, 'api')}><code>/rest/v1/${t.name}</code></a></li>`)}</ul>`}
+      </section>
+    </div>`;
 }
 
 // ---------------------------------------------------------------- SQL ----
@@ -524,14 +1039,19 @@ function SQLEditor() {
   const [run, setRun] = useState(null);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState('');
+  const [snippet, setSnippet] = useState(null); // the saved snippet being edited
+  const [saving, setSaving] = useState(false);
+  const [historyKey, setHistoryKey] = useState(0);
 
   useEffect(() => { try { localStorage.setItem(SQL_KEY, query); } catch { /* storage unavailable */ } }, [query]);
+  const load = (q, sn = null) => { setQuery(q); setSnippet(sn); setRun(null); setFailure(''); };
 
   const execute = async () => {
     setBusy(true); setFailure('');
     try {
       const r = await api('POST', '/sql', { query });
       setRun(r);
+      setHistoryKey((k) => k + 1);
       if (r.results.some((x) => /^(CREATE|ALTER|DROP|GRANT|REVOKE|COMMENT|TRUNCATE)\b/.test(x.command))) {
         window.dispatchEvent(new Event('schema-changed'));
       }
@@ -544,17 +1064,24 @@ function SQLEditor() {
 
   return html`
     <div class="page-head"><div><h1>SQL editor</h1>
-      <p>Runs as the database owner, so row level security does not apply here. Separate statements with semicolons.</p></div></div>
-    <div class="sql-editor">
-      <textarea class="mono" spellcheck="false" aria-label="SQL" value=${query}
-        onInput=${(e) => setQuery(e.target.value)} onKeyDown=${onKey}></textarea>
-      <div class="toolbar">
-        <button class="primary" disabled=${busy} onClick=${execute}>${busy ? 'Running…' : 'Run'}</button>
-        <span class="range">Ctrl or ⌘ + Enter</span>
-        <span class="spacer"></span>
-        ${run && html`<span class="range">${plural(run.results.length, 'statement', 'statements')} in ${run.duration_ms} ms</span>`}
+      <p>Runs as the database owner, so row level security does not apply here. Separate statements with semicolons. Every run is recorded in the audit log.</p></div></div>
+    <div class="sql-layout">
+      <div class="sql-editor">
+        ${snippet && html`<p class="editing-snippet">Editing <strong>${snippet.name}</strong> <button class="small quiet" onClick=${() => setSnippet(null)}>Detach</button></p>`}
+        <textarea class="mono" spellcheck="false" aria-label="SQL" value=${query}
+          onInput=${(e) => setQuery(e.target.value)} onKeyDown=${onKey}></textarea>
+        <div class="toolbar wrap">
+          <button class="primary" disabled=${busy} onClick=${execute}>${busy ? 'Running…' : 'Run'}</button>
+          <span class="range">Ctrl or ⌘ + Enter</span>
+          <span class="spacer"></span>
+          ${run && html`<span class="range">${plural(run.results.length, 'statement', 'statements')} in ${run.duration_ms} ms</span>`}
+          <button onClick=${() => setSaving(true)}>${snippet ? 'Save snippet' : 'Save as snippet'}</button>
+        </div>
       </div>
+      <${SQLSidebar} historyKey=${historyKey} current=${snippet} onPick=${load} />
     </div>
+    ${saving && html`<${SaveSnippetDialog} query=${query} snippet=${snippet}
+      onClose=${() => setSaving(false)} onSaved=${(sn) => { setSaving(false); setSnippet(sn); setHistoryKey((k) => k + 1); }} />`}
     ${failure && html`<div class="sql-error" role="alert"><strong>${failure}</strong></div>`}
     ${run && run.results.map((r, i) => html`<${SQLResult} key=${i} result=${r} />`)}
     ${run?.error && html`
@@ -565,6 +1092,71 @@ function SQLEditor() {
         ${run.error.hint && html`<span>Hint: ${run.error.hint}</span>`}
         ${run.results.length > 0 && html`<span>Statements before this one ran.</span>`}
       </div>`}`;
+}
+
+function SQLSidebar({ historyKey, current, onPick }) {
+  const [tab, setTab] = useState('snippets');
+  const [snips, reloadSnips] = useLoad(() => api('GET', '/snippets'), [historyKey]);
+  const [hist] = useLoad(() => api('GET', '/sql/history?limit=50'), [historyKey]);
+  const [confirm, setConfirm] = useState(null);
+  const firstLine = (q) => q.split('\n').find((l) => l.trim() && !l.trim().startsWith('--'))?.trim() || q.trim();
+  const remove = async (sn) => {
+    if (confirm !== sn.id) { setConfirm(sn.id); return; }
+    try { await api('DELETE', `/snippets/${enc(sn.id)}`); toast(`Deleted ${sn.name}`); setConfirm(null); reloadSnips(); } catch (err) { toast(err.message, true); }
+  };
+  return html`
+    <aside class="sql-side">
+      <div class="seg" role="tablist">
+        <button role="tab" aria-pressed=${tab === 'snippets'} onClick=${() => setTab('snippets')}>Saved</button>
+        <button role="tab" aria-pressed=${tab === 'history'} onClick=${() => setTab('history')}>History</button>
+      </div>
+      ${tab === 'snippets' && html`
+        <ul class="side-list">
+          ${(snips.data?.snippets || []).map((sn) => html`
+            <li class=${current?.id === sn.id ? 'current' : ''}>
+              <button class="pick" onClick=${() => onPick(sn.query, sn)} title=${sn.query}>
+                <strong>${sn.name}</strong><code>${firstLine(sn.query)}</code></button>
+              <button class=${'small quiet' + (confirm === sn.id ? ' danger' : '')} onClick=${() => remove(sn)}>${confirm === sn.id ? 'Confirm' : 'Delete'}</button>
+            </li>`)}
+        </ul>
+        ${snips.data?.snippets.length === 0 && html`<p class="muted side-empty">Queries you save appear here. Only you can see them.</p>`}`}
+      ${tab === 'history' && html`
+        <ul class="side-list">
+          ${(hist.data?.history || []).map((h) => html`
+            <li><button class="pick" onClick=${() => onPick(h.query)} title=${h.query}>
+              <span class="when"><i class=${h.ok ? 'ok' : 'bad'}></i>${fmtDate(h.at)}${h.ok ? '' : ', failed'}</span>
+              <code>${firstLine(h.query)}</code></button></li>`)}
+        </ul>
+        ${hist.data?.history.length === 0 && html`<p class="muted side-empty">Your recent runs appear here.</p>`}`}
+    </aside>`;
+}
+
+function SaveSnippetDialog({ query, snippet, onClose, onSaved }) {
+  const ref = useRef();
+  const [error, setError] = useState('');
+  useEffect(() => { ref.current.showModal(); }, []);
+  const submit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const asNew = e.submitter?.value === 'new' || !snippet;
+    try {
+      const r = asNew
+        ? await api('POST', '/snippets', { name: f.get('name'), query })
+        : await api('PUT', `/snippets/${enc(snippet.id)}`, { name: f.get('name'), query });
+      toast(`Saved ${r.snippet.name}`); onSaved(r.snippet);
+    } catch (err) { setError(err.message); }
+  };
+  return html`
+    <dialog ref=${ref} onClose=${onClose}>
+      <form onSubmit=${submit}>
+        <h2>${snippet ? 'Save snippet' : 'Save as snippet'}</h2>
+        <label class="field"><span>Name</span><input name="name" required maxlength="200" autofocus value=${snippet?.name || ''} /></label>
+        ${error && html`<p class="error-text" role="alert">${error}</p>`}
+        <div class="row"><button type="button" onClick=${onClose}>Cancel</button>
+          ${snippet && html`<button value="new">Save as new</button>`}
+          <button class="primary" value="update">Save</button></div>
+      </form>
+    </dialog>`;
 }
 
 function SQLResult({ result }) {
@@ -615,7 +1207,7 @@ function Users() {
 
   return html`
     <div class="page-head">
-      <div><h1>Users</h1><p>People who signed up to your app. Dashboard admins are managed separately with <code>minibase admin</code>.</p></div>
+      <div><h1>Users</h1><p>People who signed up to your app. Dashboard admins are managed on the <a href="#/admins">Admins</a> page.</p></div>
       <button class="primary" onClick=${() => setAdding(!adding)}>${adding ? 'Close' : 'Add user'}</button>
     </div>
     ${adding && html`<${AddUser} onAdded=${() => { setAdding(false); reload(); }} />`}
@@ -627,7 +1219,7 @@ function Users() {
       <button class="small" disabled=${page === 0} onClick=${() => setPage(page - 1)}>Previous</button>
       <button class="small" disabled=${(page + 1) * USERS_PAGE >= total} onClick=${() => setPage(page + 1)}>Next</button>
     </div>
-    <div class="grid-wrap">
+    <div class="grid-wrap people">
       <table class="grid">
         <thead><tr><th><span class="static">Email</span></th><th><span class="static">Signed up</span></th>
           <th><span class="static">Last sign-in</span></th><th><span class="static">Active sessions</span></th><th></th></tr></thead>
@@ -674,6 +1266,205 @@ function AddUser({ onAdded }) {
     </form>`;
 }
 
+// ---------------------------------------------------------- audit log ----
+
+const ACTIONS = {
+  'admin.sign_in': 'Signed in', 'admin.sign_in_failed': 'Failed sign-in', 'admin.sign_out': 'Signed out',
+  'admin.password_change': 'Changed own password', 'admin.create': 'Added admin', 'admin.delete': 'Deleted admin',
+  'admin.password_reset': 'Reset admin password', 'admin.sign_out_everywhere': 'Signed admin out everywhere',
+  'sql.run': 'Ran SQL',
+  'schema.table_create': 'Created table', 'schema.table_drop': 'Dropped table', 'schema.column_add': 'Added column',
+  'schema.column_drop': 'Dropped column', 'schema.rls_enable': 'Turned on RLS', 'schema.rls_disable': 'Turned off RLS',
+  'schema.policy_create': 'Added policy', 'schema.policy_drop': 'Removed policy',
+  'data.row_insert': 'Added row', 'data.row_update': 'Edited row', 'data.row_delete': 'Deleted row',
+  'data.import': 'Imported CSV', 'data.export': 'Exported CSV',
+  'users.create': 'Added user', 'users.delete': 'Deleted user', 'users.sign_out': 'Signed user out',
+};
+const GROUPS = [['', 'Everything'], ['admin.', 'Sign-ins and admins'], ['sql.', 'SQL editor'], ['schema.', 'Schema and policies'], ['data.', 'Rows and files'], ['users.', 'App users']];
+const RISKY = new Set(['admin.sign_in_failed', 'schema.table_drop', 'schema.column_drop', 'schema.rls_disable', 'schema.policy_drop', 'users.delete', 'admin.delete']);
+
+function summary(e) {
+  const d = e.detail || {};
+  if (e.action === 'sql.run') return (d.ok ? '' : 'Failed: ') + ((d.query || '').split('\n').find((l) => l.trim()) || '');
+  if (d.sql) return d.sql[0];
+  if (d.rows !== undefined) return plural(d.rows, 'row', 'rows');
+  if (d.key) return `key ${JSON.stringify(d.key)}`;
+  if (d.user_agent) return d.user_agent;
+  return '';
+}
+
+// detailText shows an entry in full: SQL as written, everything else as JSON.
+function detailText(e) {
+  const { sql, query, ...rest } = e.detail || {};
+  const parts = [`${e.action}${e.account_id ? '' : ' (no dashboard account)'}`];
+  if (query) parts.push(query);
+  if (sql) parts.push(sqlText(sql));
+  if (Object.keys(rest).length) parts.push(JSON.stringify(rest, null, 2));
+  return parts.join('\n\n');
+}
+
+function AuditLog() {
+  const [group, setGroup] = useState('');
+  const [actor, setActor] = useState('');
+  const [term, setTerm] = useState('');
+  const [entries, setEntries] = useState([]);
+  const [state, setState] = useState({ loading: true, error: null, more: false });
+  const [open, setOpen] = useState(null);
+
+  useEffect(() => { const t = setTimeout(() => setTerm(actor.trim()), 300); return () => clearTimeout(t); }, [actor]);
+  const fetchPage = async (before) => {
+    setState((s) => ({ ...s, loading: true, error: null }));
+    try {
+      const r = await api('GET', `/audit?limit=50&action=${enc(group)}&actor=${enc(term)}${before ? `&before=${before}` : ''}`);
+      setEntries((prev) => (before ? [...prev, ...r.entries] : r.entries));
+      setState({ loading: false, error: null, more: r.entries.length === 50 });
+    } catch (error) { setState({ loading: false, error, more: false }); }
+  };
+  useEffect(() => { fetchPage(0); }, [group, term]);
+
+  return html`
+    <div class="page-head"><div><h1>Audit log</h1>
+      <p>What admins did in the dashboard and with <code>minibase admin</code>, newest first. Entries are kept for <code>MINIBASE_ADMIN_AUDIT_RETENTION</code> (90 days unless changed).</p></div></div>
+    <div class="toolbar wrap">
+      <select aria-label="Kind of action" style="max-width:220px" value=${group} onChange=${(e) => setGroup(e.target.value)}>
+        ${GROUPS.map(([v, l]) => html`<option value=${v}>${l}</option>`)}</select>
+      <input type="search" placeholder="Admin email" aria-label="Filter by admin email" style="max-width:260px" value=${actor} onInput=${(e) => setActor(e.target.value)} />
+    </div>
+    ${state.error && html`<${Failed} error=${state.error} retry=${() => fetchPage(0)} />`}
+    <div class="grid-wrap audit">
+      <table class="grid">
+        <thead><tr><th><span class="static">When</span></th><th><span class="static">Who</span></th><th><span class="static">Action</span></th>
+          <th><span class="static">On</span></th><th><span class="static">Details</span></th></tr></thead>
+        <tbody>${entries.map((e) => html`
+          <tr class="clickable" tabindex="0" onClick=${() => setOpen(open === e.id ? null : e.id)} onKeyDown=${(ev) => ev.key === 'Enter' && setOpen(open === e.id ? null : e.id)}>
+            <td>${fmtDate(e.at)}</td>
+            <td>${e.actor}${e.ip && html` <small class="faint">${e.ip}</small>`}</td>
+            <td class=${RISKY.has(e.action) || e.detail?.ok === false ? 'risky' : ''}>${ACTIONS[e.action] || e.action}</td>
+            <td>${e.target}</td>
+            <td>${summary(e)}</td>
+          </tr>
+          ${open === e.id && html`<tr class="detail"><td colspan="5"><pre>${detailText(e)}</pre></td></tr>`}`)}
+        </tbody>
+      </table>
+      ${!state.loading && entries.length === 0 && !state.error && html`<div class="empty"><h3>Nothing recorded</h3><p>${group || term ? 'Nothing matches these filters.' : 'Actions appear here as admins work.'}</p></div>`}
+      ${state.loading && entries.length === 0 && html`<${Loading} />`}
+    </div>
+    ${state.more && html`<p style="margin-top:12px"><button disabled=${state.loading} onClick=${() => fetchPage(entries[entries.length - 1].id)}>Load older</button></p>`}`;
+}
+
+// ------------------------------------------------------------- admins ----
+
+function Admins({ account }) {
+  const [{ loading, data, error }, reload] = useLoad(() => api('GET', '/admins'), []);
+  const [adding, setAdding] = useState(false);
+  const [confirm, setConfirm] = useState(null);
+  const [secret, setSecret] = useState(null); // { email, password } shown once
+
+  if (loading && !data) return html`<${Loading} />`;
+  if (error) return html`<${Failed} error=${error} retry=${reload} />`;
+  const act = async (fn, done) => {
+    try { const r = await fn(); if (done) toast(done); setConfirm(null); reload(); return r; } catch (err) { toast(err.message, true); return null; }
+  };
+  const reset = async (a) => {
+    const r = await act(() => api('POST', `/admins/${enc(a.id)}/password`, { password: '' }));
+    if (r) setSecret({ email: a.email, password: r.generated_password, reset: true });
+  };
+  const admins = data.admins;
+  return html`
+    <div class="page-head">
+      <div><h1>Admins</h1><p>People who can sign in to this dashboard. They can do anything, including run SQL, so add only people you trust.</p></div>
+      <button class="primary" onClick=${() => setAdding(!adding)}>${adding ? 'Close' : 'Add admin'}</button>
+    </div>
+    ${adding && html`<${AddAdmin} onAdded=${(r, email) => { setAdding(false); reload(); if (r.generated_password) setSecret({ email, password: r.generated_password }); }} />`}
+    <div class="grid-wrap people">
+      <table class="grid">
+        <thead><tr><th><span class="static">Email</span></th><th><span class="static">Added</span></th><th><span class="static">Last sign-in</span></th><th></th></tr></thead>
+        <tbody>${admins.map((a) => html`
+          <tr>
+            <td>${a.email}${a.id === account.id && html` <span class="chip">you</span>`}</td>
+            <td>${fmtDate(a.created_at)}</td>
+            <td>${fmtDate(a.last_sign_in_at)}</td>
+            <td style="text-align:right">${a.id !== account.id && html`
+              <button class="small" onClick=${() => reset(a)}>Reset password</button>${' '}
+              <button class="small" onClick=${() => act(() => api('POST', `/admins/${enc(a.id)}/signout`), `Signed ${a.email} out everywhere`)}>Sign out everywhere</button>${' '}
+              ${confirm === a.id
+                ? html`<button class="small danger confirm" onClick=${() => act(() => api('DELETE', `/admins/${enc(a.id)}`), `Removed ${a.email}`)}>Confirm remove</button>`
+                : html`<button class="small danger" disabled=${admins.length === 1} onClick=${() => setConfirm(a.id)}>Remove</button>`}`}</td>
+          </tr>`)}</tbody>
+      </table>
+    </div>
+    <p class="muted" style="margin-top:12px">To change your own password, use Change password at the bottom of the sidebar. Locked out? Run <code>minibase admin reset-password</code> on the server.</p>
+    ${secret && html`<${SecretDialog} secret=${secret} onClose=${() => setSecret(null)} />`}`;
+}
+
+function AddAdmin({ onAdded }) {
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    setBusy(true);
+    try {
+      const r = await api('POST', '/admins', { email: f.get('email'), password: f.get('password') });
+      toast(`Added ${r.admin.email}`); onAdded(r, r.admin.email);
+    } catch (err) { setError(err.message); setBusy(false); }
+  };
+  return html`
+    <form class="inline-form" onSubmit=${submit}>
+      <label class="field"><span>Email</span><input name="email" type="email" required autofocus /></label>
+      <label class="field"><span>Password</span><input name="password" type="password" autocomplete="new-password" minlength="12" placeholder="Leave empty to generate one" /></label>
+      <button class="primary" disabled=${busy}>Add admin</button>
+      ${error && html`<p class="error-text" role="alert">${error}</p>`}
+    </form>`;
+}
+
+function SecretDialog({ secret, onClose }) {
+  const ref = useRef();
+  useEffect(() => { ref.current.showModal(); }, []);
+  return html`
+    <dialog ref=${ref} onClose=${onClose}>
+      <form method="dialog">
+        <h2>${secret.reset ? 'New password' : 'Admin added'}</h2>
+        <p>Give this password to <strong>${secret.email}</strong> over a private channel. It won't be shown again${secret.reset ? ', and their sessions have been signed out' : ''}.</p>
+        <div class="secret"><code>${secret.password}</code><${CopyButton} text=${secret.password} what="Password copied" /></div>
+        <div class="row"><button class="primary">Done</button></div>
+      </form>
+    </dialog>`;
+}
+
+// ----------------------------------------------------------- settings ----
+
+function SettingsPage() {
+  const [{ loading, data, error }, reload] = useLoad(() => api('GET', '/settings'), []);
+  const [changedOnly, setChangedOnly] = useState(false);
+  if (loading && !data) return html`<${Loading} />`;
+  if (error) return html`<${Failed} error=${error} retry=${reload} />`;
+  const mods = data.server.modules;
+  const groupOf = (name) => mods.find((m) => name.startsWith(`MINIBASE_${m.toUpperCase()}_`)) || 'server';
+  const groups = ['server', ...mods].map((g) => [g, data.settings.filter((st) => groupOf(st.name) === g && (!changedOnly || st.is_set))]).filter(([, l]) => l.length);
+  const value = (st) => {
+    if (st.secret && !st.value) return st.is_set ? html`<span class="null">set, hidden</span>` : html`<span class="null">not set</span>`;
+    if (st.value === '') return html`<span class="null">empty</span>`;
+    return html`<code>${st.value}</code>`;
+  };
+  return html`
+    <div class="page-head"><div><h1>Settings</h1>
+      <p>The configuration this server is running with, read from environment variables. Change them in <code>.env</code> and restart. Secrets are hidden or shortened.</p></div></div>
+    <div class="toolbar"><label class="check"><input type="checkbox" checked=${changedOnly} onChange=${(e) => setChangedOnly(e.target.checked)} /> Only show values set in the environment</label></div>
+    ${groups.map(([g, list]) => html`
+      <section class="settings-group">
+        <h2>${g === 'server' ? 'Server' : html`<code>${g}</code> module`}</h2>
+        <table class="plain settings">
+          <tbody>${list.map((st) => html`
+            <tr>
+              <td><code>${st.name}</code></td>
+              <td>${value(st)}</td>
+              <td class="source">${st.is_set ? (st.secret || st.value === st.default ? 'set' : html`set; default <code>${st.default || 'empty'}</code>`) : 'default'}</td>
+            </tr>`)}</tbody>
+        </table>
+      </section>`)}`;
+}
+
 // ---------------------------------------------------------------- app ----
 
 function Toasts() {
@@ -707,6 +1498,10 @@ function App() {
     case 'tables': page = html`<${Tables} route=${route} />`; break;
     case 'sql': page = html`<${SQLEditor} />`; break;
     case 'users': page = html`<${Users} />`; break;
+    case 'api': page = html`<${APIPage} />`; break;
+    case 'audit': page = html`<${AuditLog} />`; break;
+    case 'admins': page = html`<${Admins} account=${account} />`; break;
+    case 'settings': page = html`<${SettingsPage} />`; break;
     default: page = html`<${Overview} />`;
   }
 

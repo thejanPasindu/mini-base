@@ -58,6 +58,9 @@ func (s *Accounts) FindByEmail(ctx context.Context, email string) (domain.Accoun
 
 // FindByID implements port.AccountStore.
 func (s *Accounts) FindByID(ctx context.Context, id string) (domain.Account, string, error) {
+	if !validUUID(id) {
+		return domain.Account{}, "", domain.ErrAccountNotFound
+	}
 	var hash string
 	a, err := scanAccount(s.db.QueryRow(ctx,
 		`SELECT `+accountCols+`, password_hash FROM admin.accounts WHERE id = $1::uuid`, id), &hash)
@@ -101,6 +104,36 @@ func (s *Accounts) Delete(ctx context.Context, email string) error {
 		return domain.ErrAccountNotFound
 	}
 	return nil
+}
+
+// DeleteByID implements port.AccountStore. Locking every account row makes
+// the last-admin check and the delete atomic: two admins deleting each
+// other at the same moment cannot leave none.
+func (s *Accounts) DeleteByID(ctx context.Context, id string) (domain.Account, error) {
+	if !validUUID(id) {
+		return domain.Account{}, domain.ErrAccountNotFound
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var total int
+	if err := tx.QueryRow(ctx, `SELECT count(*)::int FROM (SELECT 1 FROM admin.accounts FOR UPDATE) a`).Scan(&total); err != nil {
+		return domain.Account{}, fmt.Errorf("lock admins: %w", err)
+	}
+	a, err := scanAccount(tx.QueryRow(ctx, `DELETE FROM admin.accounts WHERE id = $1::uuid RETURNING `+accountCols, id))
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if total <= 1 {
+		return domain.Account{}, domain.ErrLastAccount
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Account{}, fmt.Errorf("commit: %w", err)
+	}
+	return a, nil
 }
 
 // SetPassword implements port.AccountStore.
